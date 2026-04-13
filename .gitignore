@@ -1,0 +1,52 @@
+# 系统文件
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.swp
+*.bak
+
+# IDE 编辑器
+.idea/
+.vscode/
+*.iml
+.vs/
+.project
+.classpath
+
+# 构建输出
+dist/
+build/
+out/
+bin/
+target/
+*.class
+*.exe
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+.env
+
+# 密钥与配置
+.env
+.env.*
+!.env.example
+config.ini
+secret.json
+
+# 数据库
+*.db
+*.sqlite
+*.sql
+
+# 日志
+logs/
+log/

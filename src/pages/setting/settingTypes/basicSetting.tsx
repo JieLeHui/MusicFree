@@ -1,0 +1,1262 @@
+import ColorBlock from "@/components/base/colorBlock";
+import ListItem from "@/components/base/listItem";
+import Paragraph from "@/components/base/paragraph";
+import ThemeSwitch from "@/components/base/switch";
+import ThemeText from "@/components/base/themeText";
+import { showDialog } from "@/components/dialogs/useDialog";
+import { showPanel } from "@/components/panels/usePanel";
+import { SortType } from "@/constants/commonConst.ts";
+import pathConst from "@/constants/pathConst";
+import Config, { useAppConfig } from "@/core/appConfig";
+import { useI18N } from "@/core/i18n";
+import { ROUTE_PATH, useNavigate } from "@/core/router";
+import useColors from "@/hooks/useColors";
+import LyricUtil, { NativeTextAlignment, LYRIC_COLOR_PRESETS } from "@/native/lyricUtil";
+import { resolveLyricPresets } from "@/utils/lyricPreset";
+import { AppConfigPropertyKey } from "@/types/core/config";
+import { clearCache, getCacheSize, sizeFormatter } from "@/utils/fileUtils";
+import { clearLog, getErrorLogContent } from "@/utils/log";
+import { getQualityKeys, getQualityText } from "@/utils/qualities";
+import rpx from "@/utils/rpx";
+import Toast from "@/utils/toast";
+import announcementService from "@/services/announcementService";
+import Clipboard from "@react-native-clipboard/clipboard";
+import Slider from "@react-native-community/slider";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { SectionList, StyleSheet, TouchableOpacity, View } from "react-native";
+import { readdir, unlink as unlinkFile, writeFile } from "react-native-fs";
+import { FlatList, ScrollView } from "react-native-gesture-handler";
+import lyricManager from "@/core/lyricManager";
+import {
+    getPresetTemplates,
+    validateTemplate,
+    DEFAULT_FILE_NAMING_CONFIG,
+    TEMPLATE_VARIABLES,
+} from "@/utils/fileNamingFormatter";
+
+function createSwitch(
+    title: string,
+    changeKey: AppConfigPropertyKey,
+    value: boolean,
+    callback?: (newValue: boolean) => void,
+) {
+    const onPress = () => {
+        if (callback) {
+            callback(!value);
+        } else {
+            Config.setConfig(changeKey, !value);
+        }
+    };
+    return {
+        title,
+        onPress,
+        right: <ThemeSwitch value={value} onValueChange={onPress} />,
+    };
+}
+
+const createRadio = function (
+    title: string,
+    changeKey: AppConfigPropertyKey,
+    candidates: Array<string | number>,
+    value: string | number,
+    valueMap?: Record<string | number, string | number>,
+    onChange?: (value: string | number) => void,
+) {
+    const onPress = () => {
+        showDialog("RadioDialog", {
+            title,
+            content: valueMap
+                ? candidates.map(_ => ({
+                    label: valueMap[_] as string,
+                    value: _,
+                }))
+                : candidates,
+            onOk(val) {
+                Config.setConfig(changeKey, val);
+                onChange?.(val);
+            },
+        });
+    };
+    return {
+        title,
+        right: (
+            <ThemeText style={styles.centerText}>
+                {valueMap ? valueMap[value] : value}
+            </ThemeText>
+        ),
+        onPress,
+    };
+};
+
+function useCacheSize() {
+    const [cacheSize, setCacheSize] = useState({
+        music: 0,
+        lyric: 0,
+        image: 0,
+    });
+
+    const refreshCacheSize = useCallback(async () => {
+        const [musicCache, lyricCache, imageCache] = await Promise.all([
+            getCacheSize("music"),
+            getCacheSize("lyric"),
+            getCacheSize("image"),
+        ]);
+        setCacheSize({
+            music: musicCache,
+            lyric: lyricCache,
+            image: imageCache,
+        });
+    }, []);
+
+    return [cacheSize, refreshCacheSize] as const;
+}
+
+export default function BasicSetting() {
+
+    const autoPlayWhenAppStart = useAppConfig("basic.autoPlayWhenAppStart");
+    const openPlayDetailOnLaunch = useAppConfig("basic.openPlayDetailOnLaunch");
+    const useCelluarNetworkPlay = useAppConfig("basic.useCelluarNetworkPlay");
+    const useCelluarNetworkDownload = useAppConfig("basic.useCelluarNetworkDownload");
+    const maxDownload = useAppConfig("basic.maxDownload");
+    const clickMusicInSearch = useAppConfig("basic.clickMusicInSearch");
+    const clickMusicInAlbum = useAppConfig("basic.clickMusicInAlbum");
+    const downloadPath = useAppConfig("basic.downloadPath");
+    const notInterrupt = useAppConfig("basic.notInterrupt");
+    const tempRemoteDuck = useAppConfig("basic.tempRemoteDuck");
+    const tempRemoteDuckVolume = useAppConfig("basic.tempRemoteDuckVolume");
+    const autoStopWhenError = useAppConfig("basic.autoStopWhenError");
+    const maxCacheSize = useAppConfig("basic.maxCacheSize");
+    const defaultPlayQuality = useAppConfig("basic.defaultPlayQuality");
+    const playQualityOrder = useAppConfig("basic.playQualityOrder");
+    const defaultDownloadQuality = useAppConfig("basic.defaultDownloadQuality");
+    const downloadQualityOrder = useAppConfig("basic.downloadQualityOrder");
+    const musicDetailDefault = useAppConfig("basic.musicDetailDefault");
+    const musicDetailAwake = useAppConfig("basic.musicDetailAwake");
+    const maxHistoryLen = useAppConfig("basic.maxHistoryLen");
+    const autoUpdatePlugin = useAppConfig("basic.autoUpdatePlugin");
+    const notCheckPluginVersion = useAppConfig("basic.notCheckPluginVersion");
+    const lazyLoadPlugin = useAppConfig("basic.lazyLoadPlugin");
+    const associateLyricType = useAppConfig("basic.associateLyricType");
+    const keyboardAvoidMode = useAppConfig("basic.keyboardAvoidMode");
+    const showExitOnNotification = useAppConfig("basic.showExitOnNotification");
+    const musicOrderInLocalSheet = useAppConfig("basic.musicOrderInLocalSheet");
+    const tryChangeSourceWhenPlayFail = useAppConfig("basic.tryChangeSourceWhenPlayFail");
+    
+    // 文件命名相关配置
+    const fileNamingType = useAppConfig("basic.fileNamingType");
+    const fileNamingPreset = useAppConfig("basic.fileNamingPreset");
+    const fileNamingCustom = useAppConfig("basic.fileNamingCustom");
+    
+    // 自定义音质翻译
+    const customQualityTranslations = useAppConfig("basic.qualityTranslations");
+
+    const { t, getLanguage } = useI18N();
+    const qualityTextI18n = getQualityText(getLanguage().languageData, customQualityTranslations);
+
+    const debugEnableErrorLog = useAppConfig("debug.errorLog");
+    const debugEnableTraceLog = useAppConfig("debug.traceLog");
+    const debugEnableDevLog = useAppConfig("debug.devLog");
+
+    const navigate = useNavigate();
+
+    const [cacheSize, refreshCacheSize] = useCacheSize();
+
+    const sectionListRef = useRef<SectionList | null>(null);
+    // const titleListRef = useRef<FlatList | null>(null);
+
+    useEffect(() => {
+        refreshCacheSize();
+    }, [refreshCacheSize]);
+
+    const basicOptions = [
+        {
+            title: t("basicSettings.common"),
+            data: [
+                createRadio(
+                    t("basicSettings.maxHistoryLength"),
+                    "basic.maxHistoryLen",
+                    [20, 50, 100, 200, 500],
+                    maxHistoryLen ?? 50,
+                ),
+                createRadio(
+                    t("basicSettings.musicDetailDefault"),
+                    "basic.musicDetailDefault",
+                    ["album", "lyric"],
+                    musicDetailDefault ?? "album",
+                    {
+                        album: t("basicSettings.musicDetailDefault.album"),
+                        lyric: t("basicSettings.musicDetailDefault.lyric"),
+                    },
+                ),
+                createSwitch(
+                    t("basicSettings.musicDetailAwake"),
+                    "basic.musicDetailAwake",
+                    musicDetailAwake ?? false,
+                ),
+                createRadio(
+                    t("basicSettings.associateLyricType"),
+                    "basic.associateLyricType",
+                    ["input", "search"],
+                    associateLyricType ?? "search",
+                    {
+                        input: t("basicSettings.associateLyricType.input"),
+                        search: t("basicSettings.associateLyricType.search"),
+                    },
+                ),
+                createRadio(
+                    t("basicSettings.keyboardAvoidMode"),
+                    "basic.keyboardAvoidMode",
+                    ["auto", "manual", "off"],
+                    keyboardAvoidMode ?? "auto",
+                    {
+                        auto: t("basicSettings.keyboardAvoidMode.auto"),
+                        manual: t("basicSettings.keyboardAvoidMode.manual"),
+                        off: t("basicSettings.keyboardAvoidMode.off"),
+                    },
+                ),
+                createSwitch(
+                    t("basicSettings.showExitOnNotification"),
+                    "basic.showExitOnNotification",
+                    showExitOnNotification ?? false,
+                ),
+                {
+                    title: "音质管理",
+                    right: (
+                        <ThemeText fontSize="subTitle" style={styles.centerText}>
+                            自定义
+                        </ThemeText>
+                    ),
+                    onPress() {
+                        showPanel("QualityTranslationPanel");
+                    },
+                },
+            ],
+        },
+        {
+            title: t("basicSettings.sheetAndAlbum"),
+            data: [
+                createRadio(
+                    t("basicSettings.clickMusicInSearch"),
+                    "basic.clickMusicInSearch",
+                    ["playMusic", "playMusicAndReplace"],
+                    clickMusicInSearch ?? "playMusic",
+                    {
+                        playMusic: t("basicSettings.clickMusicInSearch.playMusic"),
+                        playMusicAndReplace: t("basicSettings.clickMusicInSearch.playMusicAndReplace"),
+                    },
+                ),
+                createRadio(
+                    t("basicSettings.clickMusicInAlbum"),
+                    "basic.clickMusicInAlbum",
+                    ["playMusic", "playAlbum"],
+                    clickMusicInAlbum ?? "playAlbum",
+                    {
+                        playMusic: t("basicSettings.clickMusicInAlbum.playMusic"),
+                        playAlbum: t("basicSettings.clickMusicInAlbum.playAlbum"),
+                    },
+                ),
+                createRadio(
+                    t("basicSettings.musicDetailDefault"),
+                    "basic.musicDetailDefault",
+                    ["album", "lyric"],
+                    musicDetailDefault ?? "album",
+                    {
+                        album: t("basicSettings.musicDetailDefault.album"),
+                        lyric: t("basicSettings.musicDetailDefault.lyric"),
+                    },
+                ),
+                createRadio(
+                    t("basicSettings.musicOrderInLocalSheet"),
+                    "basic.musicOrderInLocalSheet",
+                    [
+                        SortType.Title,
+                        SortType.Artist,
+                        SortType.Album,
+                        SortType.Newest,
+                        SortType.Oldest,
+                    ],
+                    musicOrderInLocalSheet ?? "end",
+                    {
+                        [SortType.Title]: t("basicSettings.musicOrderInLocalSheet.title"),
+                        [SortType.Artist]: t("basicSettings.musicOrderInLocalSheet.artist"),
+                        [SortType.Album]: t("basicSettings.musicOrderInLocalSheet.album"),
+                        [SortType.Newest]: t("basicSettings.musicOrderInLocalSheet.newest"),
+                        [SortType.Oldest]: t("basicSettings.musicOrderInLocalSheet.oldest"),
+                    },
+                ),
+            ],
+        },
+        {
+            title: t("basicSettings.plugin"),
+            data: [
+                createSwitch(
+                    t("basicSettings.autoUpdatePlugin"),
+                    "basic.autoUpdatePlugin",
+                    autoUpdatePlugin ?? false,
+                ),
+                createSwitch(
+                    t("basicSettings.notCheckPluginVersion"),
+                    "basic.notCheckPluginVersion",
+                    notCheckPluginVersion ?? false,
+                ),
+                createSwitch(
+                    t("basicSettings.lazyLoadPlugin"),
+                    "basic.lazyLoadPlugin",
+                    lazyLoadPlugin ?? false,
+                ),
+            ],
+        },
+        {
+            title: t("basicSettings.playback"),
+            data: [
+                createSwitch(
+                    t("basicSettings.notInterrupt"),
+                    "basic.notInterrupt",
+                    notInterrupt ?? false,
+                ),
+                createSwitch(
+                    t("basicSettings.autoPlayWhenAppStart"),
+                    "basic.autoPlayWhenAppStart",
+                    autoPlayWhenAppStart ?? false,
+                ),
+                createSwitch(
+                    t("basicSettings.openPlayDetailOnLaunch"),
+                    "basic.openPlayDetailOnLaunch",
+                    openPlayDetailOnLaunch ?? false,
+                ),
+                createSwitch(
+                    t("basicSettings.tryChangeSourceWhenPlayFail"),
+                    "basic.tryChangeSourceWhenPlayFail",
+                    tryChangeSourceWhenPlayFail ?? false,
+                ),
+                createSwitch(
+                    t("basicSettings.autoStopWhenError"),
+                    "basic.autoStopWhenError",
+                    autoStopWhenError ?? false,
+                ),
+                createRadio(
+                    t("basicSettings.tempRemoteDuck"),
+                    "basic.tempRemoteDuck",
+                    ["pause", "lowerVolume"],
+                    tempRemoteDuck ?? "pause",
+                    {
+                        pause: t("basicSettings.tempRemoteDuck.pause"),
+                        "lowerVolume": t("basicSettings.tempRemoteDuck.lowerVolume"),
+                    }
+                ),
+                ...(tempRemoteDuck === "lowerVolume" ? [
+                    createRadio(
+                        t("basicSettings.tempRemoteDuck.volumeDecreaseLevel"),
+                        "basic.tempRemoteDuckVolume",
+                        [0.3, 0.5, 0.8],
+                        tempRemoteDuckVolume ?? 0.5,
+                        {
+                            0.3: "30%",
+                            0.5: "50%",
+                            0.8: "80%",
+                        }
+                    ),
+                ] : []),
+                createRadio(
+                    t("basicSettings.defaultPlayQuality"),
+                    "basic.defaultPlayQuality",
+                    getQualityKeys(),
+                    defaultPlayQuality ?? "master",
+                    qualityTextI18n,
+                ),
+                createRadio(
+                    t("basicSettings.playQualityOrder"),
+                    "basic.playQualityOrder",
+                    ["asc", "desc"],
+                    playQualityOrder ?? "desc",
+                    {
+                        asc: t("basicSettings.playQualityOrder.asc"),
+                        desc: t("basicSettings.playQualityOrder.desc"),
+                    },
+                ),
+            ],
+        },
+        {
+            title: t("basicSettings.download"),
+            data: [
+                {
+                    title: t("basicSettings.downloadPath"),
+                    right: (
+                        <ThemeText
+                            fontSize="subTitle"
+                            style={styles.centerText}
+                            numberOfLines={3}>
+                            {downloadPath ??
+                                pathConst.downloadMusicPath}
+                        </ThemeText>
+                    ),
+                    onPress() {
+                        const handlePathSelection = async (selectedFiles: any[]) => {
+                            try {
+                                const targetDir = selectedFiles[0];
+                                // 先检查基本权限
+                                await readdir(targetDir.path);
+                                
+                                // 检查目标目录是否可写（Native 下载器基于 FileOutputStream）
+                                try {
+                                    const testPath = `${targetDir.path}/musicfree_path_test.tmp`;
+                                    await writeFile(testPath, "musicfree_path_test", "utf8");
+                                    await unlinkFile(testPath).catch(() => {});
+                                    
+                                    // 如果到这里说明路径支持，设置路径
+                                    Config.setConfig(
+                                        "basic.downloadPath",
+                                        targetDir.path,
+                                    );
+                                    return true;
+                                } catch (pathError: any) {
+                                    // 检查是否是路径不支持错误
+                                    if (pathError?.code === "EACCES" || 
+                                        pathError?.message?.includes("permission") ||
+                                        pathError?.message?.includes("denied")) {
+                                        // 显示用户友好的对话框提示
+                                        showDialog("SimpleDialog", {
+                                            title: "路径不支持",
+                                            content: "该目录不可写，请选择有写入权限的目录（如 Music 或 Downloads）",
+                                            cancelText: "知道了",
+                                            okText: "重新选择",
+                                            onOk() {
+                                                // 重新触发文件选择器
+                                                setTimeout(() => {
+                                                    navigate<"file-selector">(ROUTE_PATH.FILE_SELECTOR, {
+                                                        fileType: "folder",
+                                                        multi: false,
+                                                        actionText: t("basicSettings.fileSelector.selectFolder"),
+                                                        onAction: handlePathSelection,
+                                                    });
+                                                }, 100);
+                                            }
+                                        });
+                                        return false;
+                                    } else {
+                                        // 其他错误，可能是网络问题等，仍然允许设置路径
+                                        Config.setConfig(
+                                            "basic.downloadPath",
+                                            targetDir.path,
+                                        );
+                                        return true;
+                                    }
+                                }
+                            } catch {
+                                Toast.warn(t("toast.folderNotExistOrNoPermission"));
+                                return false;
+                            }
+                        };
+                        
+                        navigate<"file-selector">(ROUTE_PATH.FILE_SELECTOR, {
+                            fileType: "folder",
+                            multi: false,
+                            actionText: t("basicSettings.fileSelector.selectFolder"),
+                            onAction: handlePathSelection,
+                        });
+                    },
+                },
+                createRadio(
+                    t("basicSettings.maxDownload"),
+                    "basic.maxDownload",
+                    [1, 3, 5, 7],
+                    maxDownload ?? 3,
+                ),
+                createRadio(
+                    t("basicSettings.defaultDownloadQuality"),
+                    "basic.defaultDownloadQuality",
+                    getQualityKeys(),
+                    defaultDownloadQuality ?? "master",
+                    qualityTextI18n,
+                ),
+                createRadio(
+                    t("basicSettings.downloadQualityOrder"),
+                    "basic.downloadQualityOrder",
+                    ["asc", "desc"],
+                    downloadQualityOrder ?? "desc",
+                    {
+                        asc: t("basicSettings.downloadQualityOrder.asc"),
+                        desc: t("basicSettings.downloadQualityOrder.desc"),
+                    },
+                ),
+                // 文件命名格式设置
+                {
+                    title: "文件命名格式",
+                    right: (
+                        <ThemeText
+                            fontSize="subTitle"
+                            style={styles.centerText}>
+                            {fileNamingType === "custom" ? "自定义" : (fileNamingPreset || "歌曲名-歌手")}
+                        </ThemeText>
+                    ),
+                    onPress() {
+                        showDialog("RadioDialog", {
+                            title: "文件命名格式类型",
+                            content: [
+                                { label: "预设模板", value: "preset" },
+                                { label: "自定义模板", value: "custom" },
+                            ],
+                            onOk(val) {
+                                Config.setConfig("basic.fileNamingType", val as "preset" | "custom");
+                                // 设置默认值
+                                if (val === "preset" && !fileNamingPreset) {
+                                    Config.setConfig("basic.fileNamingPreset", DEFAULT_FILE_NAMING_CONFIG.preset);
+                                } else if (val === "custom" && !fileNamingCustom) {
+                                    Config.setConfig("basic.fileNamingCustom", "{title}-{artist}");
+                                }
+                            },
+                        });
+                    },
+                },
+                // 预设模板选择（仅当选择预设模板时显示）
+                ...(fileNamingType === "preset" || !fileNamingType ? [{
+                    title: "预设模板",
+                    right: (
+                        <ThemeText
+                            fontSize="subTitle"
+                            style={styles.centerText}>
+                            {fileNamingPreset || "歌曲名-歌手"}
+                        </ThemeText>
+                    ),
+                    onPress() {
+                        const presetTemplates = getPresetTemplates();
+                        showDialog("RadioDialog", {
+                            title: "选择预设模板",
+                            content: presetTemplates.map(template => ({
+                                label: template,
+                                value: template,
+                            })),
+                            onOk(val) {
+                                Config.setConfig("basic.fileNamingPreset", val as IFileNaming.IPresetTemplate);
+                            },
+                        });
+                    },
+                }] : []),
+                // 自定义模板输入（仅当选择自定义模板时显示）
+                ...(fileNamingType === "custom" ? [{
+                    title: "自定义模板",
+                    right: (
+                        <ThemeText
+                            fontSize="subTitle"
+                            style={styles.centerText}
+                            numberOfLines={2}>
+                            {fileNamingCustom || "{title}-{artist}"}
+                        </ThemeText>
+                    ),
+                    onPress() {
+                        showPanel("SimpleInput", {
+                            title: "自定义文件命名模板",
+                            placeholder: "例如: {title}-{artist}-{album}",
+                            defaultValue: fileNamingCustom || "{title}-{artist}",
+                            tips: `可用变量：${Object.entries(TEMPLATE_VARIABLES).map(([key, desc]) => `${key}(${desc})`).join(", ")}`,
+                            onOk(text, closePanel) {
+                                const validation = validateTemplate(text);
+                                if (!validation.valid) {
+                                    Toast.warn(validation.error || "模板格式错误");
+                                    return;
+                                }
+                                Config.setConfig("basic.fileNamingCustom", text);
+                                closePanel();
+                                Toast.success("模板设置成功");
+                            },
+                        });
+                    },
+                }] : []),
+                // 音乐标签设置
+                {
+                    title: "音乐标签设置",
+                    right: (
+                        <ThemeText fontSize="subTitle" style={styles.centerText}>
+                            自定义
+                        </ThemeText>
+                    ),
+                    onPress() {
+                        showPanel("MusicMetadataSettingsPanel");
+                    },
+                },
+            ],
+        },
+        {
+            title: t("basicSettings.network"),
+            data: [
+                createSwitch(
+                    t("basicSettings.useCelluarNetworkPlay"),
+                    "basic.useCelluarNetworkPlay",
+                    useCelluarNetworkPlay ?? false,
+                ),
+                createSwitch(
+                    t("basicSettings.useCelluarNetworkDownload"),
+                    "basic.useCelluarNetworkDownload",
+                    useCelluarNetworkDownload ?? false,
+                ),
+            ],
+        },
+        {
+            title: t("basicSettings.lyric"),
+            data: [],
+            footer: <LyricSetting />,
+        },
+        {
+            title: t("basicSettings.cache"),
+            data: [
+                {
+                    title: t("basicSettings.cache.musicCacheLimit"),
+                    right: (
+                        <ThemeText style={styles.centerText}>
+                            {maxCacheSize
+                                ? sizeFormatter(maxCacheSize)
+                                : "512M"}
+                        </ThemeText>
+                    ),
+                    onPress() {
+                        showPanel("SimpleInput", {
+                            title: t("dialog.setCacheTitle"),
+                            placeholder: t("dialog.setCachePlaceholder"),
+                            onOk(text, closePanel) {
+                                let val = parseInt(text, 10);
+                                if (val < 100) {
+                                    val = 100;
+                                } else if (val > 8192) {
+                                    val = 8192;
+                                }
+                                if (val >= 100 && val <= 8192) {
+                                    Config.setConfig(
+                                        "basic.maxCacheSize",
+                                        val * 1024 * 1024,
+                                    );
+                                    closePanel();
+                                    Toast.success(t("toast.cacheSetSuccess"));
+                                }
+                            },
+                        });
+                    },
+                },
+
+                {
+                    title: t("basicSettings.cache.clearMusicCache"),
+                    right: (
+                        <ThemeText style={styles.centerText}>
+                            {sizeFormatter(cacheSize.music)}
+                        </ThemeText>
+                    ),
+                    onPress() {
+                        showDialog("SimpleDialog", {
+                            title: t("dialog.clearMusicCacheTitle"),
+                            content: t("dialog.clearMusicCacheContent"),
+                            async onOk() {
+                                await clearCache("music");
+                                Toast.success(t("toast.musicCacheCleared"));
+                                refreshCacheSize();
+                            },
+                        });
+                    },
+                },
+                {
+                    title: t("basicSettings.cache.clearLyricCache"),
+                    right: (
+                        <ThemeText style={styles.centerText}>
+                            {sizeFormatter(cacheSize.lyric)}
+                        </ThemeText>
+                    ),
+                    onPress() {
+                        showDialog("SimpleDialog", {
+                            title: t("dialog.clearLyricCacheTitle"),
+                            content: t("dialog.clearLyricCacheContent"),
+                            async onOk() {
+                                await clearCache("lyric");
+                                Toast.success(t("toast.lyricCacheCleared"));
+                                refreshCacheSize();
+                            },
+                        });
+                    },
+                },
+                {
+                    title: t("basicSettings.cache.clearImageCache"),
+                    right: (
+                        <ThemeText style={styles.centerText}>
+                            {sizeFormatter(cacheSize.image)}
+                        </ThemeText>
+                    ),
+                    onPress() {
+                        showDialog("SimpleDialog", {
+                            title: t("dialog.clearImageCacheTitle"),
+                            content: t("dialog.clearImageCacheContent"),
+                            async onOk() {
+                                await clearCache("image");
+                                Toast.success(t("toast.imageCacheCleared"));
+                                refreshCacheSize();
+                            },
+                        });
+                    },
+                },
+            ],
+        },
+        {
+            title: t("basicSettings.developer"),
+            data: [
+                createSwitch(
+                    t("basicSettings.developer.errorLog"),
+                    "debug.errorLog",
+                    debugEnableErrorLog ?? false,
+                ),
+                createSwitch(
+                    t("basicSettings.developer.traceLog"),
+                    "debug.traceLog",
+                    debugEnableTraceLog ?? false,
+                ),
+                createSwitch(
+                    t("basicSettings.developer.devLog"),
+                    "debug.devLog",
+                    debugEnableDevLog ?? false,
+                ),
+                {
+                    title: t("basicSettings.developer.viewErrorLog"),
+                    right: undefined,
+                    async onPress() {
+                        // 获取日志文件夹
+                        const errorLogContent = await getErrorLogContent();
+                        showDialog("SimpleDialog", {
+                            title: t("dialog.errorLogTitle"),
+                            content: (
+                                <ScrollView>
+                                    <Paragraph>
+                                        {errorLogContent || t("dialog.errorLogNoRecord")}
+                                    </Paragraph>
+                                </ScrollView>
+                            ),
+                            cancelText: t("dialog.errorLogKnow"),
+                            okText: t("dialog.errorLogCopy"),
+                            onOk() {
+                                Clipboard.setString(errorLogContent);
+                                Toast.success(t("toast.copiedToClipboard"));
+                            },
+                        });
+                    },
+                },
+                {
+                    title: t("basicSettings.developer.clearLog"),
+                    right: undefined,
+                    async onPress() {
+                        try {
+                            await clearLog();
+                            Toast.success(t("toast.logCleared"));
+                        } catch { }
+                    },
+                },
+                {
+                    title: t("basicSettings.developer.checkAnnouncements"),
+                    right: undefined,
+                    async onPress() {
+                        try {
+                            const announcement = await announcementService.checkAnnouncements(true);
+                            if (announcement) {
+                                showDialog("AnnouncementDialog", { announcement });
+                                // @ts-ignore i18n fallback if key missing
+                                Toast.success(t("toast.announcementShown") || "已显示公告");
+                            } else {
+                                // @ts-ignore i18n fallback if key missing
+                                Toast.warn(t("toast.announcementNone") || "暂无可显示公告");
+                            }
+                        } catch {
+                            // @ts-ignore i18n fallback if key missing
+                            Toast.warn(t("toast.announcementNone") || "暂无可显示公告");
+                        }
+                    },
+                },
+                {
+                    title: t("basicSettings.developer.clearAnnouncements"),
+                    right: undefined,
+                    async onPress() {
+                        try {
+                            announcementService.clearHistory();
+                            // @ts-ignore i18n fallback if key missing
+                            Toast.success(t("toast.announcementCleared") || "公告记录已清除");
+                        } catch { }
+                    },
+                },
+            ],
+        },
+    ];
+
+    return (
+        <View style={styles.wrapper}>
+            <FlatList
+                style={styles.headerContainer}
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.headerContentContainer}
+                horizontal
+                data={basicOptions.map(it => it.title)}
+                renderItem={({ item, index }) => (
+                    <TouchableOpacity
+                        onPress={() => {
+                            sectionListRef.current?.scrollToLocation({
+                                sectionIndex: index,
+                                itemIndex: 0,
+                            });
+                        }}
+                        activeOpacity={0.7}
+                        style={styles.headerItemStyle}>
+                        <ThemeText fontWeight="bold">{item}</ThemeText>
+                    </TouchableOpacity>
+                )}
+            />
+            <SectionList
+                sections={basicOptions}
+                renderSectionHeader={({ section }) => (
+                    <View style={styles.sectionHeader}>
+                        <ThemeText
+                            fontSize="subTitle"
+                            fontColor="textSecondary"
+                            fontWeight="bold">
+                            {section.title}
+                        </ThemeText>
+                    </View>
+                )}
+                ref={sectionListRef}
+                renderSectionFooter={({ section }) => {
+                    return section.footer ?? null;
+                }}
+                renderItem={({ item }) => {
+                    const Right = item.right;
+
+                    return (
+                        <ListItem
+                            withHorizontalPadding
+                            heightType="small"
+                            onPress={item.onPress}>
+                            <ListItem.Content title={item.title} />
+                            {Right}
+                        </ListItem>
+                    );
+                }}
+            />
+        </View>
+    );
+}
+
+const styles = StyleSheet.create({
+    wrapper: {
+        width: "100%",
+        paddingBottom: rpx(24),
+        flex: 1,
+    },
+    centerText: {
+        textAlignVertical: "center",
+        maxWidth: rpx(400),
+    },
+    sectionHeader: {
+        paddingHorizontal: rpx(24),
+        height: rpx(72),
+        flexDirection: "row",
+        alignItems: "center",
+        marginTop: rpx(20),
+    },
+    headerContainer: {
+        height: rpx(80),
+    },
+    headerContentContainer: {
+        height: rpx(80),
+        alignItems: "center",
+        paddingHorizontal: rpx(24),
+    },
+    headerItemStyle: {
+        paddingHorizontal: rpx(36),
+        height: rpx(80),
+        justifyContent: "center",
+        alignItems: "center",
+    },
+});
+
+function LyricSetting() {
+    const showStatusBarLyric = useAppConfig("lyric.showStatusBarLyric");
+    const isLocked = useAppConfig("lyric.isLocked");
+    const presetIndex = useAppConfig("lyric.presetIndex");
+    const enableAutoSearchLyric = useAppConfig("lyric.autoSearchLyric");
+    const hideDesktopLyricWhenPaused = useAppConfig("lyric.hideDesktopLyricWhenPaused");
+    const enableWordByWord = useAppConfig("lyric.enableWordByWord");
+    const enableWordByWordFloat = useAppConfig("lyric.enableWordByWordFloat");
+    const pureWhiteMode = useAppConfig("lyric.pureWhiteMode");
+    const enableBreathingDots = useAppConfig("lyric.enableBreathingDots");
+    const desktopShowTranslation = useAppConfig("lyric.desktopShowTranslation");
+    const desktopShowRomanization = useAppConfig("lyric.desktopShowRomanization");
+    const desktopSecondaryFontRatio = useAppConfig("lyric.desktopSecondaryFontRatio");
+    const desktopSecondaryAlphaRatio = useAppConfig("lyric.desktopSecondaryAlphaRatio");
+    const invertColors = useAppConfig("lyric.invertColors");
+    const topPercent = useAppConfig("lyric.topPercent");
+    const widthPercent = useAppConfig("lyric.widthPercent");
+
+    const { t } = useI18N();
+    const colors = useColors();
+
+    const autoSearchLyric = createSwitch(t("basicSettings.lyric.autoSearchLyric"), "lyric.autoSearchLyric", enableAutoSearchLyric ?? false);
+    const wordByWordLyric = createSwitch("逐字歌词", "lyric.enableWordByWord", enableWordByWord ?? true);
+    const wordByWordFloat = createSwitch("逐字歌词浮动动画", "lyric.enableWordByWordFloat", enableWordByWordFloat ?? true);
+    const highlightColor = createSwitch("纯白模式", "lyric.pureWhiteMode", pureWhiteMode ?? true);
+    const breathingDots = createSwitch("空歌词行呼吸灯特效", "lyric.enableBreathingDots", enableBreathingDots ?? true);
+    const hideWhenPaused = createSwitch(t("basicSettings.lyric.hideDesktopLyricWhenPaused"), "lyric.hideDesktopLyricWhenPaused", hideDesktopLyricWhenPaused ?? true);
+    const desktopTranslation = createSwitch("桌面歌词显示翻译", "lyric.desktopShowTranslation", desktopShowTranslation ?? false);
+    const desktopRomanization = createSwitch("桌面歌词显示罗马音", "lyric.desktopShowRomanization", desktopShowRomanization ?? false);
+    const invertColorsSwitch = createSwitch("颜色反转（已唱白色/未唱彩色）", "lyric.invertColors", invertColors ?? false, (newValue) => {
+        Config.setConfig("lyric.invertColors", newValue);
+        if (showStatusBarLyric) {
+            // 刷新桌面歌词以应用反转
+            LyricUtil.hideStatusBarLyric().then(() => {
+                LyricUtil.showStatusBarLyric("MusicFree", {
+                    topPercent: Config.getConfig("lyric.topPercent"),
+                    leftPercent: Config.getConfig("lyric.leftPercent"),
+                    align: Config.getConfig("lyric.align"),
+                    color: Config.getConfig("lyric.color"),
+                    sungColor: Config.getConfig("lyric.sungColor"),
+                    backgroundColor: Config.getConfig("lyric.backgroundColor"),
+                    widthPercent: Config.getConfig("lyric.widthPercent"),
+                    fontSize: Config.getConfig("lyric.fontSize"),
+                    presetIndex: Config.getConfig("lyric.presetIndex") ?? 0,
+                    presets: resolveLyricPresets(),
+                    secondaryFontRatio: Config.getConfig("lyric.desktopSecondaryFontRatio") ?? 0.85,
+                    secondaryAlphaRatio: Config.getConfig("lyric.desktopSecondaryAlphaRatio") ?? 0.90,
+                }).then(() => {
+                    // Resync lyric line data + playback state to restore word-by-word
+                    lyricManager.resyncDesktopLyric();
+                });
+            });
+        }
+    });
+
+    // 获取当前预设的颜色（考虑自定义覆盖）
+    const customPresets = Config.getConfig("lyric.customPresets") as Array<{
+        unsungColor: string;
+        sungColor: string;
+        backgroundColor: string;
+    } | null> | undefined;
+
+    const getPresetColor = (idx: number) => {
+        const custom = customPresets?.[idx];
+        return custom ? custom.sungColor : LYRIC_COLOR_PRESETS[idx]?.sungColor ?? '#FFFFFF';
+    };
+
+    const openStatusBarLyric = createSwitch(
+        t("basicSettings.lyric.showStatusBarLyric"),
+        "lyric.showStatusBarLyric",
+        showStatusBarLyric ?? false,
+        async newValue => {
+            try {
+                if (newValue) {
+                    const hasPermission = await LyricUtil.checkSystemAlertPermission();
+                    if (hasPermission) {
+                        LyricUtil.showStatusBarLyric("MusicFree", {
+                            topPercent: Config.getConfig("lyric.topPercent"),
+                            leftPercent: Config.getConfig("lyric.leftPercent"),
+                            align: Config.getConfig("lyric.align"),
+                            color: Config.getConfig("lyric.color"),
+                            sungColor: Config.getConfig("lyric.sungColor"),
+                            backgroundColor: Config.getConfig("lyric.backgroundColor"),
+                            widthPercent: Config.getConfig("lyric.widthPercent"),
+                            fontSize: Config.getConfig("lyric.fontSize"),
+                            presetIndex: Config.getConfig("lyric.presetIndex") ?? 0,
+                            presets: resolveLyricPresets(),
+                            secondaryFontRatio: Config.getConfig("lyric.desktopSecondaryFontRatio") ?? 0.85,
+                            secondaryAlphaRatio: Config.getConfig("lyric.desktopSecondaryAlphaRatio") ?? 0.90,
+                        });
+                        Config.setConfig("lyric.showStatusBarLyric", true);
+                    } else {
+                        LyricUtil.requestSystemAlertPermission().finally(() => {
+                            Toast.warn(t("toast.noFloatWindowPermission"));
+                        });
+                    }
+                } else {
+                    LyricUtil.hideStatusBarLyric();
+                    Config.setConfig("lyric.showStatusBarLyric", false);
+                }
+            } catch { }
+        },
+    );
+
+    const openColorPicker = (title: string, currentColor: string, onSelected: (hex: string) => void) => {
+        showPanel("ColorPicker", {
+            defaultColor: currentColor,
+            onSelected: (color: any) => {
+                const hex = color.rgb().hexa().toString();
+                onSelected(hex);
+            },
+        });
+    };
+
+    const handleCustomizePreset = (idx: number) => {
+        const custom = customPresets?.[idx];
+        const base = LYRIC_COLOR_PRESETS[idx];
+        const current = custom ?? base;
+
+        showDialog("RadioDialog", {
+            title: `自定义预设 ${idx + 1}`,
+            content: [
+                { label: "未播放颜色", value: "unsungColor" },
+                { label: "已播放颜色", value: "sungColor" },
+                { label: "背景颜色", value: "backgroundColor" },
+                { label: "恢复默认", value: "reset" },
+            ],
+            onOk(val) {
+                if (val === "reset") {
+                    const newCustom = [...(customPresets ?? Array(LYRIC_COLOR_PRESETS.length).fill(null))];
+                    newCustom[idx] = null;
+                    Config.setConfig("lyric.customPresets", newCustom);
+                    if (showStatusBarLyric && (presetIndex ?? 0) === idx) {
+                        LyricUtil.setColorPreset(idx);
+                    }
+                    return;
+                }
+                const colorKey = val as "unsungColor" | "sungColor" | "backgroundColor";
+                openColorPicker(
+                    colorKey === "unsungColor" ? "未播放颜色" : colorKey === "sungColor" ? "已播放颜色" : "背景颜色",
+                    current[colorKey],
+                    (hex) => {
+                        const newCustom = [...(customPresets ?? Array(LYRIC_COLOR_PRESETS.length).fill(null))];
+                        const existing = newCustom[idx] ?? { ...base };
+                        (existing as any)[colorKey] = hex;
+                        newCustom[idx] = existing;
+                        Config.setConfig("lyric.customPresets", newCustom);
+                        // 如果当前正在使用这个预设，立即刷新
+                        if (showStatusBarLyric && (presetIndex ?? 0) === idx) {
+                            LyricUtil.hideStatusBarLyric().then(() => {
+                                LyricUtil.showStatusBarLyric("MusicFree", {
+                                    topPercent: Config.getConfig("lyric.topPercent"),
+                                    leftPercent: Config.getConfig("lyric.leftPercent"),
+                                    align: Config.getConfig("lyric.align"),
+                                    widthPercent: Config.getConfig("lyric.widthPercent"),
+                                    fontSize: Config.getConfig("lyric.fontSize"),
+                                    presetIndex: idx,
+                                    presets: resolveLyricPresets(),
+                                    secondaryFontRatio: Config.getConfig("lyric.desktopSecondaryFontRatio") ?? 0.85,
+                                    secondaryAlphaRatio: Config.getConfig("lyric.desktopSecondaryAlphaRatio") ?? 0.90,
+                                }).then(() => {
+                                    lyricManager.resyncDesktopLyric();
+                                });
+                            });
+                        }
+                    }
+                );
+            },
+        });
+    };
+
+    return (
+        <View>
+            {/* 详情页歌词设置 */}
+            <ListItem withHorizontalPadding heightType="small" onPress={autoSearchLyric.onPress}>
+                <ListItem.Content title={autoSearchLyric.title} />
+                {autoSearchLyric.right}
+            </ListItem>
+            <ListItem withHorizontalPadding heightType="small" onPress={wordByWordLyric.onPress}>
+                <ListItem.Content title={wordByWordLyric.title} />
+                {wordByWordLyric.right}
+            </ListItem>
+            <ListItem withHorizontalPadding heightType="small" onPress={wordByWordFloat.onPress}>
+                <ListItem.Content title={wordByWordFloat.title} />
+                {wordByWordFloat.right}
+            </ListItem>
+            <ListItem withHorizontalPadding heightType="small" onPress={highlightColor.onPress}>
+                <ListItem.Content title={highlightColor.title} />
+                {highlightColor.right}
+            </ListItem>
+            <ListItem withHorizontalPadding heightType="small" onPress={breathingDots.onPress}>
+                <ListItem.Content title={breathingDots.title} />
+                {breathingDots.right}
+            </ListItem>
+
+            {/* 桌面歌词设置 */}
+            <ListItem withHorizontalPadding heightType="small" onPress={openStatusBarLyric.onPress}>
+                <ListItem.Content title={openStatusBarLyric.title} />
+                {openStatusBarLyric.right}
+            </ListItem>
+            <ListItem withHorizontalPadding heightType="small" onPress={hideWhenPaused.onPress}>
+                <ListItem.Content title={hideWhenPaused.title} />
+                {hideWhenPaused.right}
+            </ListItem>
+            <ListItem withHorizontalPadding heightType="small" onPress={desktopTranslation.onPress}>
+                <ListItem.Content title={desktopTranslation.title} />
+                {desktopTranslation.right}
+            </ListItem>
+            <ListItem withHorizontalPadding heightType="small" onPress={desktopRomanization.onPress}>
+                <ListItem.Content title={desktopRomanization.title} />
+                {desktopRomanization.right}
+            </ListItem>
+            <ListItem withHorizontalPadding heightType="small">
+                <ListItem.Content title={`副行字号比例  ${((desktopSecondaryFontRatio ?? 0.85) * 100).toFixed(0)}%`} />
+            </ListItem>
+            <View style={lyricStyles.sliderContainer}>
+                <Slider
+                    style={lyricStyles.slider}
+                    minimumValue={0.5}
+                    maximumValue={1}
+                    step={0.01}
+                    value={desktopSecondaryFontRatio ?? 0.85}
+                    onValueChange={(val: number) => {
+                        if (showStatusBarLyric) {
+                            LyricUtil.setSecondaryFontRatio(val);
+                        }
+                    }}
+                    onSlidingComplete={(val: number) => {
+                        Config.setConfig("lyric.desktopSecondaryFontRatio", val);
+                    }}
+                    minimumTrackTintColor={colors.textHighlight}
+                    maximumTrackTintColor={colors.textSecondary + '40'}
+                    thumbTintColor={colors.textHighlight}
+                />
+            </View>
+            <ListItem withHorizontalPadding heightType="small">
+                <ListItem.Content title={`副行透明度比例  ${((desktopSecondaryAlphaRatio ?? 0.90) * 100).toFixed(0)}%`} />
+            </ListItem>
+            <View style={lyricStyles.sliderContainer}>
+                <Slider
+                    style={lyricStyles.slider}
+                    minimumValue={0.3}
+                    maximumValue={1}
+                    step={0.01}
+                    value={desktopSecondaryAlphaRatio ?? 0.90}
+                    onValueChange={(val: number) => {
+                        if (showStatusBarLyric) {
+                            LyricUtil.setSecondaryAlphaRatio(val);
+                        }
+                    }}
+                    onSlidingComplete={(val: number) => {
+                        Config.setConfig("lyric.desktopSecondaryAlphaRatio", val);
+                    }}
+                    minimumTrackTintColor={colors.textHighlight}
+                    maximumTrackTintColor={colors.textSecondary + '40'}
+                    thumbTintColor={colors.textHighlight}
+                />
+            </View>
+            <ListItem withHorizontalPadding heightType="small" onPress={invertColorsSwitch.onPress}>
+                <ListItem.Content title={invertColorsSwitch.title} />
+                {invertColorsSwitch.right}
+            </ListItem>
+
+            {/* 位置控制 */}
+            <ListItem withHorizontalPadding heightType="small">
+                <ListItem.Content title={`上下位置  ${Math.round((topPercent ?? 0.5) * 100)}%`} />
+            </ListItem>
+            <View style={lyricStyles.sliderContainer}>
+                <Slider
+                    style={lyricStyles.slider}
+                    minimumValue={0}
+                    maximumValue={1}
+                    step={0.01}
+                    value={topPercent ?? 0.5}
+                    onValueChange={(val: number) => {
+                        if (showStatusBarLyric) {
+                            LyricUtil.setStatusBarLyricTop(val);
+                        }
+                    }}
+                    onSlidingComplete={(val: number) => {
+                        Config.setConfig("lyric.topPercent", val);
+                    }}
+                    minimumTrackTintColor={colors.textHighlight}
+                    maximumTrackTintColor={colors.textSecondary + '40'}
+                    thumbTintColor={colors.textHighlight}
+                />
+            </View>
+            <ListItem withHorizontalPadding heightType="small">
+                <ListItem.Content title={`歌词宽度  ${Math.round((widthPercent ?? 0.8) * 100)}%`} />
+            </ListItem>
+            <View style={lyricStyles.sliderContainer}>
+                <Slider
+                    style={lyricStyles.slider}
+                    minimumValue={0.3}
+                    maximumValue={1}
+                    step={0.01}
+                    value={widthPercent ?? 0.8}
+                    onValueChange={(val: number) => {
+                        if (showStatusBarLyric) {
+                            LyricUtil.setStatusBarLyricWidth(val);
+                        }
+                    }}
+                    onSlidingComplete={(val: number) => {
+                        Config.setConfig("lyric.widthPercent", val);
+                    }}
+                    minimumTrackTintColor={colors.textHighlight}
+                    maximumTrackTintColor={colors.textSecondary + '40'}
+                    thumbTintColor={colors.textHighlight}
+                />
+            </View>
+
+            {/* 预设颜色方案（纯圆点，长按自定义） */}
+            <ListItem withHorizontalPadding heightType="small">
+                <ListItem.Content title={t("basicSettings.lyric.colorPreset")} />
+            </ListItem>
+            <View style={lyricStyles.presetRow}>
+                {LYRIC_COLOR_PRESETS.map((preset, idx) => (
+                    <TouchableOpacity
+                        key={idx}
+                        style={[
+                            lyricStyles.presetDotWrapper,
+                            (presetIndex ?? 0) === idx && lyricStyles.presetDotActive,
+                        ]}
+                        onPress={() => {
+                            Config.setConfig("lyric.presetIndex", idx);
+                            if (showStatusBarLyric) {
+                                LyricUtil.setColorPreset(idx);
+                            }
+                        }}
+                        onLongPress={() => {
+                            handleCustomizePreset(idx);
+                        }}>
+                        <View style={[lyricStyles.presetDot, { backgroundColor: getPresetColor(idx).slice(0, 7) }]} />
+                    </TouchableOpacity>
+                ))}
+            </View>
+
+            {/* 锁定时显示解锁按钮 */}
+            {isLocked && showStatusBarLyric && (
+                <ListItem
+                    withHorizontalPadding
+                    heightType="small"
+                    onPress={() => {
+                        LyricUtil.unlockDesktopLyric();
+                        Config.setConfig("lyric.isLocked", false);
+                    }}>
+                    <ListItem.Content title={t("basicSettings.lyric.unlock")} />
+                </ListItem>
+            )}
+        </View>
+    );
+}
+
+const lyricStyles = StyleSheet.create({
+    slider: {
+        flex: 1,
+        marginLeft: rpx(24),
+    },
+    sliderContainer: {
+        height: rpx(96),
+        width: "100%",
+        flexDirection: "row",
+        alignItems: "center",
+        paddingHorizontal: rpx(24),
+    },
+    presetRow: {
+        flexDirection: "row",
+        flexWrap: "wrap",
+        paddingHorizontal: rpx(24),
+        paddingBottom: rpx(16),
+        gap: rpx(20),
+        alignItems: "center",
+    },
+    presetDotWrapper: {
+        alignItems: "center",
+        justifyContent: "center",
+        width: rpx(56),
+        height: rpx(56),
+        borderRadius: rpx(28),
+        borderWidth: 2,
+        borderColor: "transparent",
+    },
+    presetDotActive: {
+        borderColor: "#FFFFFFCC",
+    },
+    presetDot: {
+        width: rpx(40),
+        height: rpx(40),
+        borderRadius: rpx(20),
+        borderWidth: 1,
+        borderColor: "rgba(128,128,128,0.3)",
+    },
+});

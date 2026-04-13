@@ -1,0 +1,136 @@
+require File.join(File.dirname(`node --print "require.resolve('expo/package.json')"`), "scripts/autolinking")
+# Resolve react_native_pods.rb with node to allow for hoisting
+require Pod::Executable.execute_command('node', ['-p',
+  'require.resolve(
+    "react-native/scripts/react_native_pods.rb",
+    {paths: [process.argv[1]]},
+  )', __dir__]).strip
+
+platform :ios, min_ios_version_supported
+require 'json'
+podfile_properties = JSON.parse(File.read(File.join(__dir__, 'Podfile.properties.json'))) rescue {}
+
+ENV['RCT_NEW_ARCH_ENABLED'] = '0' if podfile_properties['newArchEnabled'] == 'false'
+ENV['EX_DEV_CLIENT_NETWORK_INSPECTOR'] = podfile_properties['EX_DEV_CLIENT_NETWORK_INSPECTOR']
+
+prepare_react_native_project!
+
+
+def patch_reanimated_ios_attach_listener!
+  reanimated_module_path = File.join(__dir__, '..', 'node_modules', 'react-native-reanimated', 'apple', 'reanimated', 'apple', 'REAModule.mm')
+  return unless File.exist?(reanimated_module_path)
+
+  source = File.read(reanimated_module_path)
+  return if source.include?('auto runtimeExecutor = _surfacePresenter.runtimeExecutor;')
+
+  original = <<~'CODE'
+- (void)attachReactEventListener
+{
+  RCTScheduler *scheduler = [_surfacePresenter scheduler];
+  __weak __typeof__(self) weakSelf = self;
+  _surfacePresenter.runtimeExecutor(^(jsi::Runtime &runtime) {
+CODE
+
+  patched = <<~'CODE'
+- (void)attachReactEventListener
+{
+  if (_surfacePresenter == nil) {
+    return;
+  }
+  RCTScheduler *scheduler = [_surfacePresenter scheduler];
+  if (scheduler == nil) {
+    return;
+  }
+  auto runtimeExecutor = _surfacePresenter.runtimeExecutor;
+  if (!runtimeExecutor) {
+    return;
+  }
+  __weak __typeof__(self) weakSelf = self;
+  runtimeExecutor(^(jsi::Runtime &runtime) {
+CODE
+
+  if source.include?(original)
+    File.write(reanimated_module_path, source.sub(original, patched))
+    Pod::UI.puts 'Patched react-native-reanimated iOS attachReactEventListener guard'.yellow
+  else
+    Pod::UI.warn 'Unable to patch react-native-reanimated iOS attachReactEventListener guard'
+  end
+end
+
+
+# Permission setup
+$RNPermissionsUseAppTrackingTransparency = true
+$RNPermissionsUseBluetooth = true
+$RNPermissionsUseMediaLibrary = true
+$RNPermissionsUsePhotoLibrary = true
+
+linkage = ENV['USE_FRAMEWORKS']
+if linkage != nil
+  Pod::UI.puts "Configuring Pod with #{linkage}ally linked Frameworks".green
+  use_frameworks! :linkage => linkage.to_sym
+end
+
+target 'MusicFree' do
+  use_expo_modules!
+
+  # Privacy file aggregation
+  pod 'React-Core', :path => '../node_modules/react-native/', :modular_headers => true
+  $privacy_file_aggregation_enabled = true
+
+  post_integrate do |installer|
+    begin
+      expo_patch_react_imports!(installer)
+    rescue => e
+      Pod::UI.warn e
+    end
+  end
+  if ENV['EXPO_USE_COMMUNITY_AUTOLINKING'] == '1'
+    config_command = ['node', '-e', "process.argv=['', '', 'config'];require('@react-native-community/cli').run()"];
+  else
+    config_command = [
+      'node',
+      '--no-warnings',
+      '--eval',
+      'require(require.resolve(\'expo-modules-autolinking\', { paths: [require.resolve(\'expo/package.json\')] }))(process.argv.slice(1))',
+      'react-native-config',
+      '--json',
+      '--platform',
+      'ios'
+    ]
+  end
+
+  config = use_native_modules!(config_command)
+
+  patch_reanimated_ios_attach_listener!
+
+  use_react_native!(
+    :path => config[:reactNativePath],
+    :hermes_enabled => podfile_properties['expo.jsEngine'] == nil || podfile_properties['expo.jsEngine'] == 'hermes',
+    # An absolute path to your application root.
+    :app_path => "#{Pod::Config.instance.installation_root}/.."
+  )
+
+  target 'MusicFreeTests' do
+    inherit! :complete
+    # Pods for testing
+  end
+
+  post_install do |installer|
+    # https://github.com/facebook/react-native/blob/main/packages/react-native/scripts/react_native_pods.rb#L197-L202
+    react_native_post_install(
+      installer,
+      config[:reactNativePath],
+      :mac_catalyst_enabled => false,
+      # :ccache_enabled => true
+    )
+
+    # Fix for "app is in an invalid format" error
+    installer.pods_project.targets.each do |target|
+      if target.respond_to?(:product_type) and target.product_type == "com.apple.product-type.bundle"
+        target.build_configurations.each do |config|
+            config.build_settings['CODE_SIGNING_ALLOWED'] = 'NO'
+        end
+      end
+    end
+  end
+end

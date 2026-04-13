@@ -1,0 +1,1249 @@
+﻿import { getCurrentDialog, showDialog } from "@/components/dialogs/useDialog";
+import {
+    internalFakeSoundKey,
+    sortIndexSymbol,
+    timeStampSymbol,
+} from "@/constants/commonConst";
+import { MusicRepeatMode } from "@/constants/repeatModeConst";
+import delay from "@/utils/delay";
+import getUrlExt from "@/utils/getUrlExt";
+import { appendStartupBreadcrumb, errorLog, trace, devLog } from "@/utils/log";
+import { createMediaIndexMap } from "@/utils/mediaIndexMap";
+import {
+    getLocalPath,
+    isSameMediaItem,
+} from "@/utils/mediaUtils";
+import Toast from "@/utils/toast";
+import { getQualityText } from "@/utils/qualities";
+import i18n from "@/core/i18n";
+import Network from "@/utils/network";
+import PersistStatus from "@/utils/persistStatus";
+import { getQualityOrder, getSmartQuality } from "@/utils/qualities";
+import { musicIsPaused } from "@/utils/trackUtils";
+import EventEmitter from "eventemitter3";
+import { produce } from "immer";
+import { atom, getDefaultStore, useAtomValue } from "jotai";
+import shuffle from "lodash.shuffle";
+import ReactNativeTrackPlayer, {
+    Event,
+    State,
+    Track,
+    TrackMetadataBase,
+    usePlaybackState,
+    useProgress,
+} from "react-native-track-player";
+import { Platform } from "react-native";
+import LocalMusicSheet from "../localMusicSheet";
+
+import { TrackPlayerEvents } from "@/core.defination/trackPlayer";
+import type { IAppConfig } from "@/types/core/config";
+import type { IMusicHistory } from "@/types/core/musicHistory";
+import { ITrackPlayer } from "@/types/core/trackPlayer/index";
+import minDistance from "@/utils/minDistance";
+import { IPluginManager } from "@/types/core/pluginManager";
+import { ImgAsset } from "@/constants/assetsConst";
+import { resolveImportedAssetOrPath } from "@/utils/fileUtils";
+
+
+
+const currentMusicAtom = atom<IMusic.IMusicItem | null>(null);
+const repeatModeAtom = atom<MusicRepeatMode>(MusicRepeatMode.QUEUE);
+const qualityAtom = atom<IMusic.IQualityKey>("320k");
+const playListAtom = atom<IMusic.IMusicItem[]>([]);
+
+function isLoopbackHttpUrl(url?: string) {
+    if (!url) {
+        return false;
+    }
+
+    try {
+        const parsed = new URL(url);
+        return (
+            (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+            (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost" || parsed.hostname === "::1")
+        );
+    } catch {
+        return false;
+    }
+}
+
+
+class TrackPlayer extends EventEmitter<{
+    [TrackPlayerEvents.PlayEnd]: () => void;
+    [TrackPlayerEvents.CurrentMusicChanged]: (musicItem: IMusic.IMusicItem | null) => void;
+    [TrackPlayerEvents.ProgressChanged]: (progress: {
+        position: number;
+        duration: number;
+    }) => void;
+}> implements ITrackPlayer {
+    // 渚濊禆
+    private configService!: IAppConfig;
+    private musicHistoryService!: IMusicHistory;
+    private pluginManagerService!: IPluginManager;
+
+    // 褰撳墠鎾斁鐨勯煶涔愪笅鏍?
+    private currentIndex = -1;
+    // 闊充箰鎾斁鍣ㄦ湇鍔℃槸鍚﹀惎鍔?
+    private serviceInited = false;
+    // 鎾斁闃熷垪绱㈠紩map
+    private playListIndexMap = createMediaIndexMap([] as IMusic.IMusicItem[]);
+
+
+    private static maxMusicQueueLength = 10000;
+    private static halfMaxMusicQueueLength = 5000;
+    private static toggleRepeatMapping = {
+        [MusicRepeatMode.SHUFFLE]: MusicRepeatMode.SINGLE,
+        [MusicRepeatMode.SINGLE]: MusicRepeatMode.QUEUE,
+        [MusicRepeatMode.QUEUE]: MusicRepeatMode.SHUFFLE,
+    };
+    private static fakeAudioUrl = "musicfree://fake-audio";
+    private static proposedAudioUrl = "musicfree://proposed-audio";
+
+    constructor() {
+        super();
+    }
+
+    public get previousMusic() {
+        const currentMusic = this.currentMusic;
+        if (!currentMusic) {
+            return null;
+        }
+
+        return this.getPlayListMusicAt(this.currentIndex - 1);
+    }
+
+    public get currentMusic() {
+        return getDefaultStore().get(currentMusicAtom);
+    }
+
+    public get nextMusic() {
+        const currentMusic = this.currentMusic;
+        if (!currentMusic) {
+            return null;
+        }
+
+        return this.getPlayListMusicAt(this.currentIndex + 1);
+    }
+
+    public get repeatMode() {
+        return getDefaultStore().get(repeatModeAtom);
+    }
+
+    public get quality() {
+        return getDefaultStore().get(qualityAtom);
+    }
+
+    public get playList() {
+        return getDefaultStore().get(playListAtom);
+    }
+
+
+    injectDependencies(configService: IAppConfig, musicHistoryService: IMusicHistory, pluginManager: IPluginManager): void {
+        this.configService = configService;
+        this.musicHistoryService = musicHistoryService;
+        this.pluginManagerService = pluginManager;
+    }
+
+
+    async setupTrackPlayer() {
+        const rate = PersistStatus.get("music.rate");
+        const musicQueue = PersistStatus.get("music.playList");
+        const repeatMode = PersistStatus.get("music.repeatMode");
+        const progress = PersistStatus.get("music.progress");
+        const track = PersistStatus.get("music.musicItem");
+        const quality =
+            PersistStatus.get("music.quality") ||
+            this.configService.getConfig("basic.defaultPlayQuality") ||
+            "master";
+
+        // 鐘舵€佹仮澶?
+        if (rate) {
+            ReactNativeTrackPlayer.setRate(+rate / 100);
+        }
+        if (repeatMode) {
+            getDefaultStore().set(repeatModeAtom, repeatMode as MusicRepeatMode);
+        }
+
+        if (musicQueue && Array.isArray(musicQueue)) {
+            this.addAll(
+                musicQueue,
+                undefined,
+                repeatMode === MusicRepeatMode.SHUFFLE,
+            );
+        }
+
+        if (track && this.isInPlayList(track)) {
+            const shouldAutoPlayOnStartup = !!this.configService.getConfig("basic.autoPlayWhenAppStart");
+            void appendStartupBreadcrumb("trackplayer-restore-found", {
+                title: track.title,
+                hasUrl: !!track.url,
+                autoPlay: shouldAutoPlayOnStartup,
+                platform: Platform.OS,
+            });
+
+            if (Platform.OS === "ios" && isLoopbackHttpUrl(track.url)) {
+                void appendStartupBreadcrumb("trackplayer-restore-clear-loopback", {
+                    title: track.title,
+                    url: track.url,
+                });
+                devLog("warn", "[TrackPlayer] Clearing stale loopback URL on iOS restore", {
+                    url: track.url,
+                    title: track.title,
+                });
+                delete track.url;
+                delete track.headers;
+            }
+
+            if (!shouldAutoPlayOnStartup) {
+                track.isInit = true;
+            }
+
+            this.setCurrentMusic(track);
+            void appendStartupBreadcrumb("trackplayer-restore-current-set", {
+                title: track.title,
+            });
+
+            if (Platform.OS === "ios" && !shouldAutoPlayOnStartup) {
+                void appendStartupBreadcrumb("trackplayer-restore-skip-preload-ios", {
+                    title: track.title,
+                });
+                devLog("info", "[TrackPlayer] Skipping iOS startup source preload", {
+                    title: track.title,
+                });
+            } else {
+                void appendStartupBreadcrumb("trackplayer-restore-fetch-source", {
+                    title: track.title,
+                });
+                this.pluginManagerService.getByMedia(track)
+                    ?.methods.getMediaSource(track, quality)
+                    .then(async newSource => {
+                        try {
+                            const { getLocalStreamUrlIfNeeded } = require("@/service/mflac/proxy");
+                            const localUrl = await getLocalStreamUrlIfNeeded(newSource?.url, (newSource as any)?.ekey, newSource?.headers);
+                            if (localUrl) {
+                                track.url = localUrl;
+                                track.headers = undefined;
+                            } else {
+                                track.url = newSource?.url || track.url;
+                                track.headers = newSource?.headers || track.headers;
+                            }
+                        } catch {
+                            track.url = newSource?.url || track.url;
+                            track.headers = newSource?.headers || track.headers;
+                        }
+
+                        if (isSameMediaItem(this.currentMusic, track)) {
+                            void appendStartupBreadcrumb("trackplayer-restore-apply-source", {
+                                title: track.title,
+                                hasSourceUrl: !!newSource?.url,
+                            });
+                            await this.setTrackSource(track as Track, false);
+                            if (progress) {
+                                void appendStartupBreadcrumb("trackplayer-restore-seek", {
+                                    title: track.title,
+                                    progress: Number(progress) || 0,
+                                });
+                                await this.seekTo(Number(progress) || 0);
+                            }
+                        }
+                    })
+                    .catch(error => {
+                        void appendStartupBreadcrumb("trackplayer-restore-error", {
+                            title: track.title,
+                            message: error instanceof Error ? error.message : String(error),
+                        });
+                        errorLog("恢复播放音源失败", {
+                            title: track.title,
+                            platform: track.platform,
+                            error: error instanceof Error ? error.message : String(error),
+                        });
+                    });
+            }
+        }
+
+        if (!this.serviceInited) {
+
+            /**
+             * 姝や簨浠跺彲鑳戒細琚Е鍙戝娆★紙姣斿鐩存帴鏇挎崲queue锛?鍙傝€冧唬鐮侊細https://github.com/doublesymmetry/KotlinAudio
+             */
+            ReactNativeTrackPlayer.addEventListener(
+                Event.PlaybackActiveTrackChanged,
+                async evt => {
+                    if (
+                        evt.index === 1 &&
+                        evt.lastIndex === 0 &&
+                        evt.track?.url === TrackPlayer.fakeAudioUrl
+                    ) {
+                        trace("queue reached fake next track");
+                        this.emit(TrackPlayerEvents.PlayEnd);
+                        if (
+                            this.repeatMode ===
+                            MusicRepeatMode.SINGLE
+                        ) {
+                            await this.play(null, true);
+                        } else {
+                            // 褰撳墠鐢熸晥鐨勬瓕鏇叉槸涓嬩竴鏇茬殑鏍囪
+                            await this.skipToNext();
+                        }
+                    }
+                },
+            );
+
+            ReactNativeTrackPlayer.addEventListener(
+                Event.PlaybackError,
+                async e => {
+                    errorLog("鎾斁鍑洪敊", e.message);
+                    // WARNING: 涓嶇ǔ瀹氾紝鎶ラ敊鐨勬椂鍊欐湁鍙兘track宸茬粡鍙樺埌涓嬩竴棣栨瓕鍘讳簡
+                    const currentTrack =
+                        await ReactNativeTrackPlayer.getActiveTrack();
+                    if (currentTrack?.isInit) {
+                        // HACK: 閬垮厤鍒濆澶辫触鐨勬儏鍐?
+                        ReactNativeTrackPlayer.updateMetadataForTrack(0, {
+                            ...currentTrack,
+                            // @ts-ignore
+                            isInit: undefined,
+                        });
+                        return;
+                    }
+
+                    if (
+                        currentTrack?.url !== TrackPlayer.fakeAudioUrl && currentTrack?.url !== TrackPlayer.proposedAudioUrl &&
+                        (await ReactNativeTrackPlayer.getActiveTrackIndex()) === 0 &&
+                        e.message &&
+                        e.message !== "android-io-file-not-found"
+                    ) {
+                        trace("鎾斁鍑洪敊", {
+                            message: e.message,
+                            code: e.code,
+                        });
+
+                        this.handlePlayFail();
+                    }
+                },
+            );
+
+            this.serviceInited = true;
+        }
+    }
+
+    /**************** 鎾斁闃熷垪 ******************/
+    getMusicIndexInPlayList(musicItem?: IMusic.IMusicItem | null) {
+        if (!musicItem) {
+            return -1;
+        }
+        return this.playListIndexMap.getIndex(musicItem);
+    }
+
+    isInPlayList(musicItem?: IMusic.IMusicItem | null) {
+        if (!musicItem) {
+            return false;
+        }
+
+        return this.playListIndexMap.has(musicItem);
+    }
+
+    getPlayListMusicAt(index: number): IMusic.IMusicItem | null {
+        const playList = this.playList;
+        const len = playList.length;
+        if (len === 0) {
+            return null;
+        }
+        return playList[(index + len) % len];
+    }
+
+    isPlayListEmpty() {
+        return this.playList.length === 0;
+    }
+
+    /****** 鎾斁閫昏緫 *****/
+    addAll(
+        musicItems: Array<IMusic.IMusicItem>,
+        beforeIndex?: number,
+        shouldShuffle?: boolean,
+    ): void {
+        const now = Date.now();
+        let newPlayList: IMusic.IMusicItem[] = [];
+        let currentPlayList = this.playList;
+        musicItems.forEach((item, index) => {
+            item[timeStampSymbol] = now;
+            item[sortIndexSymbol] = index;
+        });
+
+        if (beforeIndex === undefined || beforeIndex < 0) {
+            // 1.1. 娣诲姞鍒版瓕鍗曟湯灏撅紝骞惰繃婊ゆ帀宸叉湁鐨勬瓕鏇?
+            newPlayList = currentPlayList.concat(
+                musicItems.filter(item => !this.isInPlayList(item)),
+            );
+        } else {
+            // 1.2. 鏂扮殑鎾斁鍒楄〃锛屾彃鍏?
+            const indexMap = createMediaIndexMap(musicItems);
+            const beforeDraft = currentPlayList
+                .slice(0, beforeIndex)
+                .filter(item => !indexMap.has(item));
+            const afterDraft = currentPlayList
+                .slice(beforeIndex)
+                .filter(item => !indexMap.has(item));
+
+            newPlayList = [...beforeDraft, ...musicItems, ...afterDraft];
+        }
+
+        // 濡傛灉澶暱浜?
+        if (newPlayList.length > TrackPlayer.maxMusicQueueLength) {
+            newPlayList = this.shrinkPlayListToSize(
+                newPlayList,
+                beforeIndex ?? newPlayList.length - 1,
+            );
+        }
+
+        // 2. 濡傛灉闇€瑕侀殢鏈?
+        if (shouldShuffle) {
+            newPlayList = shuffle(newPlayList);
+        }
+        // 3. 璁剧疆鎾斁鍒楄〃
+        this.setPlayList(newPlayList);
+    }
+
+    add(
+        musicItem: IMusic.IMusicItem | IMusic.IMusicItem[],
+        beforeIndex?: number,
+    ): void {
+        this.addAll(
+            Array.isArray(musicItem) ? musicItem : [musicItem],
+            beforeIndex,
+        );
+    }
+
+    addNext(musicItem: IMusic.IMusicItem | IMusic.IMusicItem[]): void {
+        const shouldAutoPlay = this.isPlayListEmpty() || !this.currentMusic;
+
+        this.add(musicItem, this.currentIndex + 1);
+
+        if (shouldAutoPlay) {
+            this.play(Array.isArray(musicItem) ? musicItem[0] : musicItem);
+        }
+    }
+
+    async remove(musicItem: IMusic.IMusicItem): Promise<void> {
+        const playList = this.playList;
+
+        let newPlayList: IMusic.IMusicItem[] = [];
+        let currentMusic: IMusic.IMusicItem | null = this.currentMusic;
+        const targetIndex = this.getMusicIndexInPlayList(musicItem);
+        let shouldPlayCurrent: boolean | null = null;
+        if (targetIndex === -1) {
+            // 1. 杩欑鎯呭喌搴旇鏄嚭閿欎簡
+            return;
+        }
+        // 2. 绉婚櫎鐨勬槸褰撳墠椤?
+        if (this.currentIndex === targetIndex) {
+            // 2.1 鍋滄鎾斁锛岀Щ闄ゅ綋鍓嶉」
+            newPlayList = produce(playList, draft => {
+                draft.splice(targetIndex, 1);
+            });
+            // 2.2 璁剧疆鏂扮殑鎾斁鍒楄〃锛屽苟鏇存柊褰撳墠闊充箰
+            if (newPlayList.length === 0) {
+                currentMusic = null;
+                shouldPlayCurrent = false;
+            } else {
+                currentMusic = newPlayList[this.currentIndex % newPlayList.length];
+                try {
+                    const state = (
+                        await ReactNativeTrackPlayer.getPlaybackState()
+                    ).state;
+                    shouldPlayCurrent = !musicIsPaused(state);
+                } catch {
+                    shouldPlayCurrent = false;
+                }
+            }
+            this.setCurrentMusic(currentMusic);
+        } else {
+            // 3. 鍒犻櫎
+            newPlayList = produce(playList, draft => {
+                draft.splice(targetIndex, 1);
+            });
+        }
+
+        this.setPlayList(newPlayList);
+        if (shouldPlayCurrent === true) {
+            await this.play(currentMusic, true);
+        } else if (shouldPlayCurrent === false) {
+            await ReactNativeTrackPlayer.reset();
+        }
+    }
+
+    isCurrentMusic(musicItem?: IMusic.IMusicItem | null) {
+        return isSameMediaItem(musicItem, this.currentMusic);
+    }
+
+    async play(
+        musicItem?: IMusic.IMusicItem | null,
+        forcePlay?: boolean,
+    ): Promise<void> {
+        const playStartTime = Date.now();
+        devLog('info', '[TrackPlayer] Play method called', {
+            title: musicItem?.title,
+            forcePlay,
+            timestamp: playStartTime
+        });
+
+        try {
+            // 濡傛灉涓嶄紶鍙傦紝榛樿鏄挱鏀惧綋鍓嶉煶涔?
+            if (!musicItem) {
+                musicItem = this.currentMusic;
+            }
+            if (!musicItem) {
+                throw new Error(PlayFailReason.PLAY_LIST_IS_EMPTY);
+            }
+            // 1. 绉诲姩缃戠粶绂佹鎾斁
+            const localPath = getLocalPath(musicItem);
+            if (
+                Network.isCellular &&
+                !this.configService.getConfig("basic.useCelluarNetworkPlay") &&
+                !LocalMusicSheet.isLocalMusic(musicItem) &&
+                !localPath
+            ) {
+                await ReactNativeTrackPlayer.reset();
+                throw new Error(PlayFailReason.FORBID_CELLUAR_NETWORK_PLAY);
+            }
+
+            // 2. 濡傛灉鏄綋鍓嶆鍦ㄦ挱鏀剧殑闊抽
+            if (this.isCurrentMusic(musicItem)) {
+                // 鑾峰彇搴曞眰鎾斁鍣ㄤ腑鐨則rack
+                const currentTrack = await ReactNativeTrackPlayer.getTrack(0);
+                // 2.1 濡傛灉褰撳墠鏈夋簮
+                if (
+                    currentTrack?.url &&
+                    isSameMediaItem(
+                        musicItem,
+                        currentTrack as IMusic.IMusicItem,
+                    )
+                ) {
+                    const currentActiveIndex =
+                        await ReactNativeTrackPlayer.getActiveTrackIndex();
+                    if (currentActiveIndex !== 0) {
+                        await ReactNativeTrackPlayer.skip(0);
+                    }
+                    if (forcePlay) {
+                        // 2.1.1 寮哄埗閲嶆柊寮€濮?
+                        await this.seekTo(0);
+                    }
+                    const currentState = (
+                        await ReactNativeTrackPlayer.getPlaybackState()
+                    ).state;
+                    if (currentState === State.Stopped) {
+                        await this.setTrackSource(currentTrack);
+                    }
+                    if (currentState !== State.Playing) {
+                        // 2.1.2 鎭㈠鎾斁
+                        await ReactNativeTrackPlayer.play();
+                    }
+                    // 杩欑鎯呭喌涓嬶紝鎾斁闃熷垪鍜屽綋鍓嶆瓕鏇查兘涓嶉渶瑕佸彉鍖?
+                    return;
+                }
+                // 2.2 鍏朵粬鎯呭喌锛氶噸鏂拌幏鍙栨簮
+            }
+
+            // 3. 濡傛灉娌℃湁鍦ㄦ挱鏀惧垪琛ㄤ腑锛屾坊鍔犲埌闃熷熬锛涘悓鏃舵洿鏂板垪琛ㄧ姸鎬?
+            const inPlayList = this.isInPlayList(musicItem);
+            if (!inPlayList) {
+                this.add(musicItem);
+            }
+
+            // 4. 鏇存柊鍒楄〃鐘舵€佸拰褰撳墠闊充箰
+            devLog('info', '[TrackPlayer] Setting current music and emitting event', {
+                title: musicItem.title,
+                timestamp: Date.now(),
+                elapsed: Date.now() - playStartTime
+            });
+
+            this.setCurrentMusic(musicItem);
+
+            devLog('info', '[TrackPlayer] Current music set, initializing queue', {
+                timestamp: Date.now(),
+                elapsed: Date.now() - playStartTime
+            });
+
+            await ReactNativeTrackPlayer.setQueue([{
+                ...musicItem,
+                url: TrackPlayer.proposedAudioUrl,
+                artwork: resolveImportedAssetOrPath(musicItem.artwork?.trim?.()?.length ? musicItem.artwork : ImgAsset.albumDefault) as unknown as any,
+            }, this.getFakeNextTrack()]);
+
+            devLog('info', '[TrackPlayer] Queue initialized, fetching media source', {
+                timestamp: Date.now(),
+                elapsed: Date.now() - playStartTime
+            });
+
+            // 5. 鑾峰彇闊虫簮
+            let track: IMusic.IMusicItem;
+
+            // 5.1 閫氳繃鎻掍欢鑾峰彇闊虫簮
+            const plugin = this.pluginManagerService.getByName(musicItem.platform);
+            
+            // 5.2 鏅鸿兘闊宠川閫夋嫨
+            const preferredQuality = this.configService.getConfig("basic.defaultPlayQuality") ?? "master";
+            let selectedQuality: IMusic.IQualityKey;
+            
+            // 濡傛灉闊充箰椤瑰寘鍚煶璐ㄤ俊鎭紝浣跨敤鏅鸿兘閫夋嫨
+            if (musicItem.qualities || musicItem.source) {
+                selectedQuality = getSmartQuality(
+                    preferredQuality,
+                    (musicItem.qualities || musicItem.source) as IMusic.IQuality | undefined,
+                    plugin?.supportedQualities // 鍋囪鎻掍欢鎻愪緵鏀寔鐨勯煶璐ㄥ垪琛?
+                );
+            } else {
+                // 鍥為€€鍒颁紶缁熺殑闊宠川鎺掑簭鏂规硶
+                selectedQuality = preferredQuality;
+            }
+            
+            // 5.3 鑾峰彇闊宠川鎺掑簭浣滀负鍚庡
+            const qualityOrder = getQualityOrder(
+                selectedQuality,
+                this.configService.getConfig("basic.playQualityOrder") ?? "asc",
+            );
+            
+            // 5.4 鎻掍欢杩斿洖闊虫簮
+            let source: IPlugin.IMediaSourceResult | null = null;
+            
+            // 棣栧厛灏濊瘯鏅鸿兘閫夋嫨鐨勯煶璐?
+            if (this.isCurrentMusic(musicItem)) {
+                source = (await plugin?.methods?.getMediaSource(
+                    musicItem,
+                    selectedQuality,
+                )) ?? null;
+                
+                if (source) {
+                    try {
+                        const { getLocalStreamUrlIfNeeded } = require("@/service/mflac/proxy");
+                        const localUrl = await getLocalStreamUrlIfNeeded(source.url, (source as any)?.ekey, source.headers);
+                        if (localUrl) {
+                            source.url = localUrl;
+                            source.headers = undefined;
+                        }
+                    } catch {}
+                    this.setQuality(selectedQuality);
+                } else {
+                    // 鏅鸿兘閫夋嫨澶辫触锛屽洖閫€鍒伴亶鍘嗘墍鏈夐煶璐?
+                    let fallbackQuality: IMusic.IQualityKey | null = null;
+                    
+                    for (let quality of qualityOrder) {
+                        if (this.isCurrentMusic(musicItem)) {
+                            source = (await plugin?.methods?.getMediaSource(
+                                musicItem,
+                                quality,
+                            )) ?? null;
+                            // 5.4.1 鑾峰彇鍒扮湡瀹炴簮
+                            if (source) {
+                                try {
+                                    const { getLocalStreamUrlIfNeeded } = require("@/service/mflac/proxy");
+                                    const localUrl = await getLocalStreamUrlIfNeeded(source.url, (source as any)?.ekey, source.headers);
+                                    if (localUrl) {
+                                        source.url = localUrl;
+                                        source.headers = undefined;
+                                    }
+                                } catch {}
+                                this.setQuality(quality);
+                                fallbackQuality = quality;
+                                break;
+                            }
+                        } else {
+                            // 5.4.2 宸茬粡鍒囨崲鍒板叾浠栨瓕鏇蹭簡锛?
+                            return;
+                        }
+                    }
+                    
+                    // 鏄剧ず闊宠川涓嶆敮鎸佹彁绀猴紝鍖呭惈闄嶇骇缁撴灉
+                    this.showQualityNotSupportedToast(selectedQuality, musicItem, fallbackQuality);
+                }
+            }
+
+            if (!this.isCurrentMusic(musicItem)) {
+                return;
+            }
+            if (!source) {
+                // 濡傛灉鏈塻ource
+                if (musicItem.source) {
+                    for (let quality of qualityOrder) {
+                        if (musicItem.source[quality]?.url) {
+                            source = musicItem.source[quality]!;
+                            this.setQuality(quality);
+
+                            break;
+                        }
+                    }
+                }
+                // 5.4 娌℃湁杩斿洖婧?
+                if (!source && !musicItem.url) {
+                    // 鎻掍欢澶辨晥鐨勬儏鍐?
+                    if (this.configService.getConfig("basic.tryChangeSourceWhenPlayFail")) {
+                        // 閲嶈瘯
+                        const similarMusic = await this.getSimilarMusic(
+                            musicItem,
+                            "music",
+                            () => !this.isCurrentMusic(musicItem),
+                        );
+
+                        if (similarMusic) {
+                            const similarMusicPlugin =
+                                this.pluginManagerService.getByMedia(similarMusic);
+
+                            for (let quality of qualityOrder) {
+                                if (this.isCurrentMusic(musicItem)) {
+                                    source =
+                                        (await similarMusicPlugin?.methods?.getMediaSource(
+                                            similarMusic,
+                                            quality,
+                                        )) ?? null;
+                                    // 5.4.1 鑾峰彇鍒扮湡瀹炴簮
+                                    if (source) {
+                                        try {
+                                            const { getLocalStreamUrlIfNeeded } = require("@/service/mflac/proxy");
+                                            devLog('info', '馃幍[trackPlayer] 灏濊瘯澶勭悊mflac', {
+                                                url: source.url,
+                                                hasEkey: !!source.ekey,
+                                                ekeyLength: source.ekey?.length
+                                            });
+                                            const localUrl = await getLocalStreamUrlIfNeeded(source.url, source.ekey, source.headers);
+                                            if (localUrl) {
+                                                devLog('info', '鉁匸trackPlayer] mflac浠ｇ悊URL鐢熸垚鎴愬姛', { localUrl });
+                                                source.url = localUrl;
+                                                source.headers = undefined;
+                                            } else {
+                                                devLog('warn', '鈿狅笍[trackPlayer] mflac浠ｇ悊URL鐢熸垚澶辫触');
+                                            }
+                                        } catch (error: any) {
+                                            devLog('error', '鉂孾trackPlayer] mflac澶勭悊寮傚父', error);
+                                        }
+                                        this.setQuality(quality);
+                                        break;
+                                    }
+                                } else {
+                                    // 5.4.2 宸茬粡鍒囨崲鍒板叾浠栨瓕鏇蹭簡锛?
+                                    return;
+                                }
+                            }
+                        }
+
+                        if (!source) {
+                            throw new Error(PlayFailReason.INVALID_SOURCE);
+                        }
+                    } else {
+                        throw new Error(PlayFailReason.INVALID_SOURCE);
+                    }
+                } else {
+                    source = {
+                        url: musicItem.url,
+                    };
+                    // 浣跨敤鐢ㄦ埛璁剧疆鐨勯粯璁ら煶璐紝鑰屼笉鏄‖缂栫爜
+                    this.setQuality(preferredQuality);
+                }
+            }
+
+            // 6. 鐗规畩绫诲瀷婧?
+            if (getUrlExt(source.url) === ".m3u8") {
+                // @ts-ignore
+                source.type = "hls";
+            }
+            // 7. 鍚堝苟缁撴灉
+            track = this.mergeTrackSource(musicItem, source) as IMusic.IMusicItem;
+
+            // 8. 鏂板鍘嗗彶璁板綍
+            this.musicHistoryService.addMusic(musicItem);
+
+            devLog('info', '[TrackPlayer] Media source obtained, starting playback', {
+                timestamp: Date.now(),
+                elapsed: Date.now() - playStartTime,
+                hasUrl: !!track.url
+            });
+
+            trace("鑾峰彇闊虫簮鎴愬姛", track);
+
+            // 9. 璁剧疆闊虫簮骞剁珛鍗冲紑濮嬫挱鏀?- CRITICAL: 涓嶇瓑寰呬换浣曞叾浠栨搷浣?
+            await this.setTrackSource(track as Track);
+
+            devLog('info', '[TrackPlayer] Playback started successfully', {
+                timestamp: Date.now(),
+                elapsed: Date.now() - playStartTime
+            });
+
+            // 10. 寮傛鑾峰彇琛ュ厖淇℃伅 - 瀹屽叏鍚庡彴鎵ц锛岀粷瀵逛笉闃诲鎾斁
+            // CRITICAL FIX: Use setTimeout(0) to push to end of event queue after playback starts
+            setTimeout(() => {
+                (async () => {
+                    try {
+                        const info = (await plugin?.methods?.getMusicInfo?.(musicItem)) ?? null;
+                        if (info) {
+                            if (
+                                (typeof info.url === "string" && info.url.trim() === "") ||
+                                (info.url && typeof info.url !== "string")
+                            ) {
+                                delete info.url;
+                            }
+
+                            // 11. 璁剧疆琛ュ厖淇℃伅
+                            if (this.isCurrentMusic(musicItem)) {
+                                const mergedTrack = this.mergeTrackSource(track, info);
+                                getDefaultStore().set(currentMusicAtom, mergedTrack as IMusic.IMusicItem);
+                                await ReactNativeTrackPlayer.updateMetadataForTrack(
+                                    0,
+                                    mergedTrack as TrackMetadataBase,
+                                );
+                            }
+                        }
+                    } catch (err) {
+                        devLog('warn', '[TrackPlayer] Failed to fetch additional music info', err);
+                    }
+                })();
+            }, 0);
+        } catch (e: any) {
+            const message = e?.message;
+            if (
+                message ===
+                "The player is not initialized. Call setupPlayer first."
+            ) {
+                await ReactNativeTrackPlayer.setupPlayer();
+                this.play(musicItem, forcePlay);
+            } else if (message === PlayFailReason.FORBID_CELLUAR_NETWORK_PLAY) {
+                if (getCurrentDialog()?.name !== "SimpleDialog") {
+                    showDialog("SimpleDialog", {
+                        title: "娴侀噺鎻愰啋",
+                        content:
+                            "Current connection is not Wi-Fi. Enable cellular playback in settings to continue.",
+                    });
+                }
+            } else if (message === PlayFailReason.INVALID_SOURCE) {
+                trace("playback failed because source is empty");
+                await this.handlePlayFail();
+            } else if (message === PlayFailReason.PLAY_LIST_IS_EMPTY) {
+                // 闃熷垪鏄┖鐨勶紝涓嶅簲璇ュ嚭鐜拌繖绉嶆儏鍐?
+            }
+        }
+    }
+
+    async pause(): Promise<void> {
+        await ReactNativeTrackPlayer.pause();
+    }
+
+    toggleRepeatMode(): void {
+        this.setRepeatMode(TrackPlayer.toggleRepeatMapping[this.repeatMode]);
+    }
+
+    // 娓呯┖鎾斁闃熷垪
+    async clearPlayList(): Promise<void> {
+        this.setPlayList([]);
+        this.setCurrentMusic(null);
+
+        await ReactNativeTrackPlayer.reset();
+        PersistStatus.set("music.musicItem", undefined);
+        PersistStatus.set("music.progress", 0);
+    }
+
+    async skipToNext(): Promise<void> {
+        if (this.isPlayListEmpty()) {
+            this.setCurrentMusic(null);
+            return;
+        }
+
+        await this.play(this.getPlayListMusicAt(this.currentIndex + 1), true);
+    }
+
+    async skipToPrevious(): Promise<void> {
+        if (this.isPlayListEmpty()) {
+            this.setCurrentMusic(null);
+            return;
+        }
+
+        await this.play(
+            this.getPlayListMusicAt(this.currentIndex === -1 ? 0 : this.currentIndex - 1),
+            true,
+        );
+    }
+
+    async changeQuality(newQuality: IMusic.IQualityKey): Promise<boolean> {
+        // 鑾峰彇褰撳墠鐨勯煶涔愬拰杩涘害
+        if (newQuality === this.quality) {
+            return true;
+        }
+
+        // 鑾峰彇褰撳墠姝屾洸
+        const musicItem = this.currentMusic;
+        if (!musicItem) {
+            return false;
+        }
+        try {
+            const progress = await ReactNativeTrackPlayer.getProgress();
+            const plugin = this.pluginManagerService.getByMedia(musicItem);
+            const newSource = await plugin?.methods?.getMediaSource(
+                musicItem,
+                newQuality,
+            );
+            if (!newSource?.url) {
+                throw new Error(PlayFailReason.INVALID_SOURCE);
+            }
+            if (this.isCurrentMusic(musicItem)) {
+                const playingState = (
+                    await ReactNativeTrackPlayer.getPlaybackState()
+                ).state;
+                try {
+                    const { getLocalStreamUrlIfNeeded } = require("@/service/mflac/proxy");
+                    const localUrl = await getLocalStreamUrlIfNeeded(newSource.url, (newSource as any)?.ekey, newSource.headers);
+                    const adapted = localUrl ? { ...newSource, url: localUrl, headers: undefined } : newSource;
+                    await this.setTrackSource(
+                        this.mergeTrackSource(musicItem, adapted) as unknown as Track,
+                        !musicIsPaused(playingState),
+                    );
+                } catch {
+                    await this.setTrackSource(
+                        this.mergeTrackSource(musicItem, newSource) as unknown as Track,
+                        !musicIsPaused(playingState),
+                    );
+                }
+
+                await this.seekTo(progress.position ?? 0);
+                this.setQuality(newQuality);
+            }
+            return true;
+        } catch {
+            // 淇敼澶辫触
+            return false;
+        }
+    }
+
+    async playWithReplacePlayList(
+        musicItem: IMusic.IMusicItem,
+        newPlayList: IMusic.IMusicItem[],
+    ): Promise<void> {
+        if (newPlayList.length !== 0) {
+            const now = Date.now();
+            if (newPlayList.length > TrackPlayer.maxMusicQueueLength) {
+                newPlayList = this.shrinkPlayListToSize(
+                    newPlayList,
+                    newPlayList.findIndex(it => isSameMediaItem(it, musicItem)),
+                );
+            }
+
+            newPlayList.forEach((it, index) => {
+                it[timeStampSymbol] = now;
+                it[sortIndexSymbol] = index;
+            });
+
+            this.setPlayList(
+                this.repeatMode === MusicRepeatMode.SHUFFLE
+                    ? shuffle(newPlayList)
+                    : newPlayList,
+            );
+            await this.play(musicItem, true);
+        }
+    }
+
+    async seekTo(progress: number) {
+        PersistStatus.set("music.progress", progress);
+        return ReactNativeTrackPlayer.seekTo(progress);
+    }
+
+    getProgress = ReactNativeTrackPlayer.getProgress;
+    getRate = ReactNativeTrackPlayer.getRate;
+    setRate = ReactNativeTrackPlayer.setRate;
+    reset = ReactNativeTrackPlayer.reset;
+
+
+    /**************** 杈呭姪鍑芥暟 -- 璁剧疆鍐呴儴鐘舵€?****************/
+
+    private setCurrentMusic(musicItem?: IMusic.IMusicItem | null) {
+        // 璁剧疆UI鍐呴儴鐘舵€佺殑musicitem
+        if (!musicItem) {
+            this.currentIndex = -1;
+            getDefaultStore().set(currentMusicAtom, null);
+            PersistStatus.set("music.musicItem", undefined);
+            PersistStatus.set("music.progress", 0);
+
+            this.emit(TrackPlayerEvents.CurrentMusicChanged, null);
+            return;
+        }
+        if (typeof musicItem.artwork !== "string") {
+            musicItem.artwork = ImgAsset.albumDefault;
+        }
+        this.currentIndex = this.getMusicIndexInPlayList(musicItem);
+        getDefaultStore().set(currentMusicAtom, musicItem);
+
+        this.emit(TrackPlayerEvents.CurrentMusicChanged, musicItem);
+    }
+
+    private setRepeatMode(mode: MusicRepeatMode) {
+        const playList = this.playList;
+        let newPlayList: IMusic.IMusicItem[];
+        const prevMode = getDefaultStore().get(repeatModeAtom);
+        if (
+            (prevMode === MusicRepeatMode.SHUFFLE &&
+                mode !== MusicRepeatMode.SHUFFLE) ||
+            (mode === MusicRepeatMode.SHUFFLE &&
+                prevMode !== MusicRepeatMode.SHUFFLE)
+        ) {
+            if (mode === MusicRepeatMode.SHUFFLE) {
+                newPlayList = shuffle(playList);
+            } else {
+                newPlayList = this.sortByTimestampAndIndex(playList, true);
+            }
+            this.setPlayList(newPlayList);
+        }
+
+        getDefaultStore().set(repeatModeAtom, mode);
+        // 鏇存柊涓嬩竴棣栨瓕鐨勪俊鎭?
+        ReactNativeTrackPlayer.updateMetadataForTrack(
+            1,
+            this.getFakeNextTrack(),
+        );
+        // 璁板綍
+        PersistStatus.set("music.repeatMode", mode);
+    }
+
+    private setQuality(quality: IMusic.IQualityKey) {
+        getDefaultStore().set(qualityAtom, quality);
+        PersistStatus.set("music.quality", quality);
+    }
+
+    // 璁剧疆闊虫簮
+    private async setTrackSource(track: Track, autoPlay = true) {
+        const clonedTrack = this.patchMediaArtwork(track);
+        if (!clonedTrack) {
+            return;
+        }
+        await ReactNativeTrackPlayer.setQueue([clonedTrack, this.getFakeNextTrack()]);
+        PersistStatus.set("music.musicItem", track as IMusic.IMusicItem);
+        PersistStatus.set("music.progress", 0);
+        if (autoPlay) {
+            await ReactNativeTrackPlayer.play();
+        }
+    }
+
+    /**
+     * 璁剧疆鎾斁闃熷垪
+     * @param newPlayList 鎾斁闃熷垪
+     * @param persist 鏄惁鎸佷箙鍖?
+     */
+    private setPlayList(newPlayList: IMusic.IMusicItem[], persist = true) {
+        getDefaultStore().set(playListAtom, newPlayList);
+
+        this.playListIndexMap = createMediaIndexMap(newPlayList);
+
+        if (persist) {
+            PersistStatus.set("music.playList", newPlayList);
+        }
+
+        this.currentIndex = this.getMusicIndexInPlayList(this.currentMusic);
+    }
+
+
+    /**************** 杈呭姪鍑芥暟 -- 宸ュ叿鏂规硶 ****************/
+    private shrinkPlayListToSize = (
+        queue: IMusic.IMusicItem[],
+        targetIndex = this.currentIndex,
+    ) => {
+        // 鎾斁鍒楄〃涓婇檺锛屽お澶氭棤娉曠紦瀛樼姸鎬?
+        if (queue.length > TrackPlayer.maxMusicQueueLength) {
+            if (targetIndex < TrackPlayer.halfMaxMusicQueueLength) {
+                queue = queue.slice(0, TrackPlayer.maxMusicQueueLength);
+            } else {
+                const right = Math.min(
+                    queue.length,
+                    targetIndex + TrackPlayer.halfMaxMusicQueueLength,
+                );
+                const left = Math.max(0, right - TrackPlayer.maxMusicQueueLength);
+                queue = queue.slice(left, right);
+            }
+        }
+        return queue;
+    };
+
+    private mergeTrackSource(
+        mediaItem: ICommon.IMediaBase,
+        props: Record<string, any> | undefined,
+    ) {
+        return props
+            ? {
+                ...mediaItem,
+                ...props,
+                id: mediaItem.id,
+                platform: mediaItem.platform,
+            }
+            : mediaItem;
+    }
+
+    private sortByTimestampAndIndex(array: any[], newArray = false) {
+        if (newArray) {
+            array = [...array];
+        }
+        return array.sort((a, b) => {
+            const ts = a[timeStampSymbol] - b[timeStampSymbol];
+            if (ts !== 0) {
+                return ts;
+            }
+            return a[sortIndexSymbol] - b[sortIndexSymbol];
+        });
+    }
+
+    private getFakeNextTrack() {
+        let track: Track | undefined;
+        const repeatMode = this.repeatMode;
+        if (repeatMode === MusicRepeatMode.SINGLE) {
+            // 鍗曟洸寰幆
+            track = this.getPlayListMusicAt(this.currentIndex) as Track;
+        } else {
+            // 涓嬩竴鏇?
+            track = this.getPlayListMusicAt(this.currentIndex + 1) as Track;
+        }
+
+        if (track) {
+            return produce(track, _ => {
+                _.url = TrackPlayer.fakeAudioUrl;
+                _.$ = internalFakeSoundKey;
+                _.artwork = resolveImportedAssetOrPath(ImgAsset.albumDefault) as unknown as any;
+            });
+        } else {
+            // 鍙湁鍒楄〃闀垮害涓?鏃舵墠浼氬嚭鐜扮殑鐗规畩鎯呭喌
+            return {
+                url: TrackPlayer.fakeAudioUrl,
+                $: internalFakeSoundKey,
+            } as Track;
+        }
+    }
+
+    private showQualityNotSupportedToast(
+        requestedQuality: IMusic.IQualityKey,
+        musicItem: IMusic.IMusicItem,
+        fallbackQuality?: IMusic.IQualityKey | null,
+    ) {
+        // 鑾峰彇鐢ㄦ埛鑷畾涔夌殑闊宠川缈昏瘧璁剧疆
+        const customQualityTranslations = this.configService.getConfig("basic.qualityTranslations");
+        const languageData = i18n.getLanguage().languageData;
+        const qualityTextI18n = getQualityText(languageData, customQualityTranslations);
+        
+        const requestedDisplayName = qualityTextI18n[requestedQuality];
+        const platformPrefix = musicItem.platform ? `[${musicItem.platform}] ` : "";
+        
+        let message: string;
+        if (fallbackQuality) {
+            const fallbackDisplayName = qualityTextI18n[fallbackQuality];
+            message = `${platformPrefix}姝屾洸涓嶆敮鎸?{requestedDisplayName}锛屽凡闄嶇骇鑷?{fallbackDisplayName}`;
+        } else {
+            message = `${platformPrefix}姝屾洸涓嶆敮鎸?{requestedDisplayName}锛屾棤娉曟挱鏀捐闊宠川`;
+        }
+        
+        // 鏄剧ずToast鎻愮ず
+        Toast.warn(message);
+    }
+
+
+    private async handlePlayFail() {
+        // 濡傛灉鑷姩璺宠浆涓嬩竴鏇? 500s鍚庤嚜鍔ㄨ烦杞?
+        if (!this.configService.getConfig("basic.autoStopWhenError")) {
+            await delay(500);
+            await this.skipToNext();
+        }
+    }
+
+    /**
+ *
+ * @param musicItem 闊充箰绫诲瀷
+ * @param type 濯掍綋绫诲瀷
+ * @param abortFunction 濡傛灉鍑芥暟涓簍rue锛屽垯涓柇
+ * @returns
+ */
+    private async getSimilarMusic<T extends ICommon.SupportMediaType>(
+        musicItem: IMusic.IMusicItem,
+        type: T = "music" as T,
+        abortFunction?: () => boolean,
+    ): Promise<ICommon.SupportMediaItemBase[T] | null> {
+        const keyword = musicItem.alias || musicItem.title;
+        const plugins = this.pluginManagerService.getSearchablePlugins(type);
+
+        let distance = Infinity;
+        let minDistanceMusicItem;
+        let targetPlugin;
+
+        const startTime = Date.now();
+
+        for (let plugin of plugins) {
+            // 瓒呮椂鏃堕棿锛?s
+            if (abortFunction?.() || Date.now() - startTime > 8000) {
+                break;
+            }
+            if (plugin.name === musicItem.platform) {
+                continue;
+            }
+            const results = await plugin.methods
+                .search(keyword, 1, type)
+                .catch(() => null);
+
+            // 鍙栧墠涓や釜
+            const firstTwo = results?.data?.slice(0, 2) || [];
+
+            for (let item of firstTwo) {
+                if (item.title === keyword && item.artist === musicItem.artist) {
+                    distance = 0;
+                    minDistanceMusicItem = item;
+                    targetPlugin = plugin;
+                    break;
+                } else {
+                    const dist =
+                        minDistance(keyword, musicItem.title) +
+                        minDistance(item.artist, musicItem.artist);
+                    if (dist < distance) {
+                        distance = dist;
+                        minDistanceMusicItem = item;
+                        targetPlugin = plugin;
+                    }
+                }
+            }
+
+            if (distance === 0) {
+                break;
+            }
+        }
+        if (minDistanceMusicItem && targetPlugin) {
+            return minDistanceMusicItem as ICommon.SupportMediaItemBase[T];
+        }
+
+        return null;
+    }
+
+
+    private patchMediaArtwork(track: Track) {
+        // Bug: React native track player 鍦ㄨ缃煶棰戞椂锛宎rtwork涓嶈兘涓簄ull锛屽苟涓旈儴鍒嗘儏鍐典笅artwork涓嶈兘涓篒mageSource绫诲瀷
+        if (!track) {
+            return null;
+        }
+        return {
+            ...track,
+            artwork: resolveImportedAssetOrPath(
+                track.artwork?.trim?.()?.length ? track.artwork : ImgAsset.albumDefault,
+            ) as unknown as any,
+        };
+    }
+
+}
+
+export const usePlayList = () => useAtomValue(playListAtom);
+export const useCurrentMusic = () => useAtomValue(currentMusicAtom);
+export const useRepeatMode = () => useAtomValue(repeatModeAtom);
+export const useMusicQuality = () => useAtomValue(qualityAtom);
+export function useMusicState() {
+    const playbackState = usePlaybackState();
+
+    return playbackState.state;
+}
+export { State as MusicState, useProgress };
+
+enum PlayFailReason {
+    /** 绂佹绉诲姩缃戠粶鎾斁 */
+    FORBID_CELLUAR_NETWORK_PLAY = "FORBID_CELLUAR_NETWORK_PLAY",
+    /** 鎾斁鍒楄〃涓虹┖ */
+    PLAY_LIST_IS_EMPTY = "PLAY_LIST_IS_EMPTY",
+    /** 鏃犳晥婧?*/
+    INVALID_SOURCE = "INVALID_SOURCE",
+    /** 闈炲綋鍓嶉煶涔?*/
+}
+
+const trackPlayer = new TrackPlayer();
+export default trackPlayer;
+

@@ -1,0 +1,25 @@
+{
+  "announcements": [
+    {
+      "id": "1",
+      "title": "⚠️ 重要声明",
+      "content": [
+        "本项目仅在QQ群发布，从未授权过任何公众号、网站或其他渠道转载分发。",
+        "",
+        "唯一官方QQ群：1064805856",
+        "唯一官方仓库：https://github.com/Toskysun/MusicFree",
+        "",
+        "插件导入链接：https://music.cwo.cc.cd",
+        "请勿从非官方渠道下载，以免遭受安全风险。"
+      ],
+      "priority": 1,
+      "minVersion": "0.6.2",
+      "maxVersion": "0.6.99",
+      "expireTime": "2027-12-31T23:59:59+08:00",
+      "showOnce": false,
+      "type": "warning",
+      "createTime": "2026-01-05T00:00:00+08:00"
+    }
+  ],
+  "timestamp": "2026-02-13T00:00:00+08:00"
+}
