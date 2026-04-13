@@ -1,145 +1,46 @@
-name: Build iOS IPA (TrollStore)
+- name: Create IPA (TrollStore Friendly)
+  run: |
+    set -euo pipefail
+    # 定义路径
+    BUILD_DIR="ios/build/Build/Products/Release-iphoneos"
+    IPA_NAME="MusicFree_${{ steps.build-version.outputs.raw }}.ipa"
 
-on:
-  workflow_dispatch:
-    inputs:
-        version:
-            description: 'Version to build (e.g., v0.6.48)'
-            required: true
-            default: 'v0.6.48'
-            type: string
+    # 1. 先找到编译生成的 .app 文件（兼容不同项目名）
+    APP_FILE=$(find "${BUILD_DIR}" -maxdepth 1 -name "*.app" | head -n 1)
+    if [[ -z "${APP_FILE}" ]]; then
+      echo "❌ 错误：未找到编译生成的 .app 文件！"
+      ls -la "${BUILD_DIR}"
+      exit 1
+    fi
+    echo "✅ 找到APP文件: ${APP_FILE}"
 
-permissions:
-  contents: write
+    # 2. 正确创建 Payload 文件夹，并把 .app 复制进去
+    rm -rf "${BUILD_DIR}/Payload"  # 清理旧文件夹
+    mkdir -p "${BUILD_DIR}/Payload"
+    cp -R "${APP_FILE}" "${BUILD_DIR}/Payload/"
 
-jobs:
-  build-ios:
-    runs-on: macos-15
-    env:
-      RCT_NEW_ARCH_ENABLED: '0'
+    # 3. 验证 Info.plist 存在
+    PLIST_PATH="${BUILD_DIR}/Payload/$(basename "${APP_FILE}")/Info.plist"
+    if [[ ! -f "${PLIST_PATH}" ]]; then
+      echo "❌ 错误：Info.plist 不存在！"
+      ls -la "${BUILD_DIR}/Payload/"
+      exit 1
+    fi
+    echo "✅ 验证Info.plist成功: ${PLIST_PATH}"
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    # 4. 修复巨魔签名（可选，增强兼容性）
+    /usr/libexec/PlistBuddy -c "Delete :SigningCertificate" "${PLIST_PATH}" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c "Delete :SigningIdentity" "${PLIST_PATH}" 2>/dev/null || true
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: 'package-lock.json'
+    # 5. 打包生成IPA
+    cd "${BUILD_DIR}"
+    zip -r "${IPA_NAME}" Payload/
 
-      - name: Resolve build version
-        id: build-version
-        run: |
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            RAW_VERSION="${GITHUB_REF_NAME}"
-          else
-            RAW_VERSION="${{ github.event.inputs.version }}"
-          fi
-          VERSION="${RAW_VERSION#v}"
-          echo "raw=${RAW_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "build_number=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
-
-      - name: Select Xcode 26
-        run: |
-          set -euo pipefail
-          # 搜索Xcode 26
-          XCODE_APP=$(find /Applications -maxdepth 1 -type d -name 'Xcode_26*.app' | sort -V | tail -n 1)
-          if [[ -z "${XCODE_APP}" ]]; then
-            echo "Xcode 26 not found, trying Xcode 15..."
-            XCODE_APP=$(find /Applications -maxdepth 1 -type d -name 'Xcode*.app' | sort -V | tail -n 1)
-          fi
-          sudo xcode-select -s "${XCODE_APP}/Contents/Developer"
-          xcodebuild -version
-          pod --version
-          node -v
-          npm -v
-
-      - name: Cache CocoaPods
-        uses: actions/cache@v4
-        with:
-          path: |
-            ios/Pods
-            ~/Library/Caches/CocoaPods
-          key: ${{ runner.os }}-pods-${{ hashFiles('ios/Podfile', 'ios/Podfile.properties.json', 'package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-pods-
-
-      - name: Install dependencies
-        run: npm ci --legacy-peer-deps --prefer-offline --no-audit --progress=false
-
-      - name: Sync build version
-        run: |
-          VERSION="${{ steps.build-version.outputs.version }}"
-          echo "Syncing package.json/app.json version to ${VERSION}"
-          node -e "
-            const fs = require('fs');
-            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-            pkg.version = '${VERSION}';
-            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-
-            const app = JSON.parse(fs.readFileSync('app.json', 'utf8'));
-            app.expo = app.expo || {};
-            app.expo.version = '${VERSION}';
-            fs.writeFileSync('app.json', JSON.stringify(app, null, 2) + '\n');
-          "
-
-      - name: Generate build info
-        run: npm run generate-build-info
-
-      - name: Install CocoaPods
-        run: |
-          cd ios
-          pod install --repo-update
-
-      - name: Build iOS (No Codesign)
-        run: |
-          cd ios
-          xcodebuild -workspace MusicFree.xcworkspace \
-            -scheme MusicFreeNew \
-            -configuration Release \
-            -sdk iphoneos \
-            -derivedDataPath build \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            MARKETING_VERSION="${{ steps.build-version.outputs.version }}" \
-            CURRENT_PROJECT_VERSION="${{ steps.build-version.outputs.build_number }}" \
-            -allowProvisioningUpdates
-
-      - name: Create IPA (TrollStore Friendly)
-        run: |
-          # 定义输出目录
-          OUTPUT_DIR="ios/build/Build/Products/Release-iphoneos"
-          IPA_NAME="MusicFree_${{ steps.build-version.outputs.raw }}.ipa"
-          
-          # 进入构建产物目录
-          cd "${OUTPUT_DIR}"
-          
-          # 修复签名权限 (关键：移除代码签名限制)
-          /usr/libexec/PlistBuddy -c "Add :com.apple.developer.team-identifier string" Payload/MusicFree.app/Info.plist || true
-          
-          # 生成 IPA
-          zip -r "${IPA_NAME}" Payload/MusicFree.app
-          
-          # 回显结果
-          echo "✅ 生成 IPA: ${IPA_NAME}"
-          ls -la *.ipa
-
-      - name: Upload IPA artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: MusicFree-iOS-TrollStore
-          path: ios/build/Build/Products/Release-iphoneos/*.ipa
-          retention-days: 90
-
-      - name: Upload to Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: ios/build/Build/Products/Release-iphoneos/*.ipa
+    # 6. 验证IPA生成成功
+    if [[ ! -f "${IPA_NAME}" ]]; then
+      echo "❌ 错误：IPA生成失败！"
+      ls -la
+      exit 1
+    fi
+    echo "✅ IPA生成成功: ${IPA_NAME}"
+    ls -la "${IPA_NAME}"
