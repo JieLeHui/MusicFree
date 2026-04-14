@@ -81,14 +81,20 @@ static id MusicFreeJSONSafeValue(id value)
   if ([value isKindOfClass:NSDictionary.class]) {
     NSMutableDictionary<NSString *, id> *result = [NSMutableDictionary dictionaryWithCapacity:((NSDictionary *)value).count];
     for (id key in (NSDictionary *)value) {
-      NSString *safeKey = [key isKindOfClass:NSString.class] ? key : [key description];
+      NSString *safeKey = [key isKindOfClass:NSString.class] ? key : @"<non-string-key>";
       result[safeKey] = MusicFreeJSONSafeValue(((NSDictionary *)value)[key]) ?: [NSNull null];
     }
     return result;
   }
 
-  return [value description] ?: @"";
+  @try {
+    NSString *desc = [value description];
+    return desc ?: @"<no-description>";
+  } @catch (__unused NSException *exception) {
+    return [NSString stringWithFormat:@"<exception-in-description:%s>", class_getName([value class])];
+  }
 }
+
 
 static NSString *MusicFreeISO8601Timestamp(void)
 {
@@ -110,10 +116,6 @@ static void MusicFreeAppendNativeStartupLog(NSString *step, NSDictionary *detail
         return;
       }
 
-      if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
-      }
-
       NSMutableDictionary *payload = [NSMutableDictionary dictionary];
       payload[@"ts"] = MusicFreeISO8601Timestamp();
       payload[@"sessionId"] = MusicFreeLaunchSessionId();
@@ -129,11 +131,28 @@ static void MusicFreeAppendNativeStartupLog(NSString *step, NSDictionary *detail
         return;
       }
 
-      NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
-      [handle seekToEndOfFile];
-      [handle writeData:jsonData];
-      [handle writeData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
-      [handle closeFile];
+      NSData *lineData = [@"\n" dataUsingEncoding:NSUTF8StringEncoding];
+      NSData *logData = [jsonData length] > 0 ? [NSMutableData dataWithData:jsonData] : nil;
+      if (logData) {
+        [(NSMutableData *)logData appendData:lineData];
+      } else {
+        return;
+      }
+
+      NSFileManager *fileManager = [NSFileManager defaultManager];
+      if ([fileManager fileExistsAtPath:path]) {
+        NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (handle != nil) {
+          @try {
+            [handle seekToEndOfFile];
+            [handle writeData:logData];
+            [handle closeFile];
+          } @catch (__unused NSException *e) {
+          }
+        }
+      } else {
+        [fileManager createFileAtPath:path contents:logData attributes:nil];
+      }
     } @catch (__unused NSException *exception) {
     }
   }
